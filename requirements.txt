@@ -1,0 +1,5 @@
+deltalake==1.6.6
+pyarrow>=16
+pandas>=2.0
+psycopg2-binary>=2.9
+matplotlib>=3.7
