@@ -1,7 +1,18 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
-lowrox_lake/
-*.zip
 .env
 .DS_Store
+*.zip
+
+# Lake output. LOWROX_LAKE_ROOT can point anywhere, so the obvious names are
+# listed and the Delta/control markers are matched at any depth — committing a
+# lake means committing every Parquet file and every version of it.
+lowrox_lake/
+lake/
+*_lake/
+**/_delta_log/
+**/_control/
+**/bronze/
+**/silver/
+**/gold/
