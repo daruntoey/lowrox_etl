@@ -17,7 +17,7 @@ import json
 import time
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, date
 from decimal import Decimal
 from pathlib import Path
@@ -27,9 +27,10 @@ import psycopg2
 import pyarrow as pa
 from deltalake import DeltaTable, write_deltalake
 
-from .config import CONTROL, SOURCE_DSN, RunConfig, SourceTable
-from .errors import (DeadLetterQueue, ErrorLog, SchemaDriftError,
-                     SourceUnavailable, retry)
+from .config import CONTROL, RunConfig, SourceTable, source_dsn
+from .errors import (AuthenticationError, CircuitBreakerOpen, DeadLetterQueue,
+                     ErrorLog, SchemaDriftError, SourceUnavailable,
+                     classify_connection_error, retry)
 from .faults import FaultInjector
 from .lineage import LineageRegistry, new_batch_id, stamp
 from .metrics import MetricsCollector
@@ -180,9 +181,12 @@ def extract_table(tbl: SourceTable, cfg: RunConfig, run_id: str,
             FaultInjector.check("extract.source_unavailable", scope=tbl.name)
             FaultInjector.check("extract.timeout", scope=tbl.name)
             try:
-                conn = psycopg2.connect(SOURCE_DSN, connect_timeout=10)
+                conn = psycopg2.connect(source_dsn(), connect_timeout=cfg.connect_timeout)
             except psycopg2.Error as exc:
-                raise SourceUnavailable(str(exc)) from exc
+                # A bad credential is not a transient fault. Classifying it
+                # correctly is what stops the retry loop from hammering the
+                # pooler and tripping its circuit breaker.
+                raise classify_connection_error(exc) from exc
             try:
                 cols = describe_source(conn, tbl.name)
                 colnames = [c for c, _ in cols]
@@ -272,27 +276,103 @@ def extract_all(cfg: RunConfig, run_id: str, log: ErrorLog,
     Parallel extraction (course slide: Parallel Extraction). Tables are
     independent of one another at this stage, so they are read concurrently;
     one table failing does not abort the others unless fail_fast is set.
+
+    The exception is a credential problem. Isolation is the right default for a
+    fault that belongs to one table, and exactly the wrong one for a fault that
+    belongs to the connection: carrying on through the other seventeen tables
+    turns one bad password into fifty-four authentication failures, which is
+    what trips a pooler's circuit breaker and locks the account out. So an
+    authentication error or an already-open breaker stops the whole phase.
     """
     log.stage = f"extract:{cfg.load_type}"
     results, failures = [], []
     tables = cfg.selected()
+    abort = threading.Event()
 
+    def guarded(t: SourceTable):
+        if abort.is_set():
+            raise SourceUnavailable("skipped: extraction aborted on a credential error")
+        return extract_table(t, cfg, run_id, log, metrics, lineage, dlq)
+
+    skipped = 0
     with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
-        futures = {
-            pool.submit(extract_table, t, cfg, run_id, log, metrics, lineage, dlq): t
-            for t in tables
-        }
+        futures = {pool.submit(guarded, t): t for t in tables}
         for fut in as_completed(futures):
             t = futures[fut]
             try:
                 results.append(fut.result())
+            except CancelledError:
+                # Cancelled because the phase was aborted, not because this
+                # table failed. Counted, not reported as eighteen errors.
+                skipped += 1
+            except (AuthenticationError, CircuitBreakerOpen) as exc:
+                if not abort.is_set():
+                    abort.set()
+                    for f in futures:
+                        f.cancel()
+                    _report_credential_failure(exc, log)
+                failures.append({"table": t.name, "error": f"{type(exc).__name__}: {exc}"})
+            except SourceUnavailable as exc:
+                if abort.is_set() and "aborted on a credential error" in str(exc):
+                    skipped += 1
+                else:
+                    log.error(f"{t.name}: extraction failed after retries — "
+                              f"{type(exc).__name__}: {exc}")
+                    failures.append({"table": t.name,
+                                     "error": f"{type(exc).__name__}: {exc}"})
+                    if cfg.fail_fast:
+                        raise
             except Exception as exc:
-                log.error(f"{t.name}: extraction failed after retries — {type(exc).__name__}: {exc}")
+                log.error(f"{t.name}: extraction failed after retries — "
+                          f"{type(exc).__name__}: {exc}")
                 failures.append({"table": t.name, "error": f"{type(exc).__name__}: {exc}"})
                 if cfg.fail_fast:
                     raise
 
+    if skipped:
+        log.error(f"{skipped} further table(s) not attempted — the connection "
+                  f"problem above applies to all of them")
     if failures:
         dlq.put(pd.DataFrame(failures), stage="extract", reason="table_level_failure")
 
     return pd.DataFrame(results or [{"table": None, "rows": 0, "version": None}])
+
+
+def _report_credential_failure(exc: Exception, log: ErrorLog) -> None:
+    """One clear explanation, printed once, instead of eighteen identical ones."""
+    host = source_dsn().split("@")[-1]
+    user = source_dsn().split("//")[-1].split(":")[0] if "//" in source_dsn() else "?"
+    log.error(f"aborting extraction — {type(exc).__name__}")
+    print("\n" + "=" * 72)
+    if isinstance(exc, CircuitBreakerOpen):
+        print("POOLER CIRCUIT BREAKER IS OPEN")
+        print("=" * 72)
+        print(f"host : {host}")
+        print("\nSupabase's pooler blocks an IP after 10 failed authentications")
+        print("in a 150-second window, and the block lasts 120 seconds. Every")
+        print("further attempt with the wrong password RE-TRIGGERS it, so the")
+        print("lockout keeps extending.")
+        print("\nWhat to do, in this order:")
+        print("  1. STOP running cells. Wait a full 2 minutes without trying.")
+        print("  2. Meanwhile, verify the password — this breaker only ever")
+        print("     trips on authentication, so the credential is wrong.")
+        print("     Supabase -> Settings -> Database -> Reset database password")
+        print("  3. Update the connection string, then re-run Part 0.")
+    else:
+        print("AUTHENTICATION FAILED")
+        print("=" * 72)
+        print(f"host : {host}")
+        print(f"user : {user}")
+        print(f"\n{str(exc).strip().splitlines()[0]}")
+        print("\nExtraction was stopped after the FIRST failure rather than")
+        print("retried across all 18 tables, because a wrong credential cannot")
+        print("succeed on a retry and repeated attempts trip the pooler's")
+        print("circuit breaker (10 failures / 150s -> 120s lockout).")
+        print("\nCheck, in this order:")
+        print("  1. the username is  postgres.<project-ref>  for the pooler,")
+        print("     not plain 'postgres'")
+        print("  2. the password is the DATABASE password, not your Supabase")
+        print("     account password  (Settings -> Database -> Reset if unsure)")
+        print("  3. if it contains # / ? @ : % it must be percent-encoded:")
+        print("         from urllib.parse import quote; quote(pw, safe='')")
+    print("=" * 72)

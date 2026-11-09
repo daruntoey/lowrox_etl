@@ -27,8 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 RESULTS: list[dict] = []
 
-# The three loaded datasets. Same 18-table schema, same generator, more rows.
-SCALES = [
+# Candidate datasets for the scaling curve: the same 18-table schema and the
+# same generator, seeded at three sizes. Only the ones that actually answer are
+# used, so this file still works against a single Supabase project — which is
+# the normal case, since nobody wants three copies of their data up there.
+CANDIDATE_SCALES = [
     ("50 rows/table",   "lowrox",     "50"),
     ("500 rows/table",  "lowrox_s10", "500"),
     ("2000 rows/table", "lowrox_s40", "2000"),
@@ -53,6 +56,54 @@ _ORIGINAL_ENV = {
 
 def _dsn(db: str) -> str:
     return f"postgresql://{PG_USER}:{PG_PASS}@{PG_HOST}:{PG_PORT}/{db}"
+
+
+def _reachable(dsn: str) -> int | None:
+    """Row count of ms_users, or None if the database is not there."""
+    import psycopg2
+    try:
+        with psycopg2.connect(dsn, connect_timeout=8) as c, c.cursor() as cur:
+            cur.execute("SELECT count(*) FROM ms_users")
+            return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+_SCALES_CACHE: list | None = None
+
+
+def available_scales(verbose: bool = False) -> list[tuple[str, str, str]]:
+    """
+    Which of the candidate datasets exist. Falls back to whatever
+    LOWROX_SOURCE_DSN points at, so a single Supabase project still produces
+    throughput, latency and parallelism numbers — only the multi-volume
+    scaling curve needs the extra seeds.
+    """
+    global _SCALES_CACHE
+    if _SCALES_CACHE is not None:
+        return _SCALES_CACHE
+
+    found = []
+    for label, db, size in CANDIDATE_SCALES:
+        n = _reachable(_dsn(db))
+        if n is not None:
+            found.append((f"{n} users", db, size))
+
+    if not found:
+        base = _ORIGINAL_ENV.get("LOWROX_SOURCE_DSN") or os.environ.get("LOWROX_SOURCE_DSN", "")
+        n = _reachable(base)
+        db = base.rsplit("/", 1)[-1].split("?")[0] if base else "source"
+        found = [(f"{n} users" if n is not None else "source", db, "base")]
+        if verbose:
+            print(f"Only one dataset reachable ({db}). The scaling curve needs the "
+                  f"seeded copies;\nsee the note printed by test_scaling_curve().")
+    _SCALES_CACHE = found
+    return found
+
+
+def largest_scale_db() -> str:
+    """The biggest dataset available, for the single-volume benchmarks."""
+    return available_scales()[-1][1]
 
 
 def restore_defaults():
@@ -98,9 +149,10 @@ def _run_against(db: str, lake: str, *, workers: int = 4, load_type: str = "init
 # ==========================================================================
 def test_throughput_by_layer(verbose: bool = True) -> pd.DataFrame:
     """Rows per second at each layer, at the largest volume."""
-    result, wall = _run_against("lowrox_s40", "/tmp/lake_perf_throughput")
+    db = largest_scale_db()
+    result, wall = _run_against(db, "/tmp/lake_perf_throughput")
     df = result.metrics.layer_summary()
-    df.insert(0, "dataset", "2000 rows/table")
+    df.insert(0, "dataset", db)
     RESULTS.append({"test": "throughput_by_layer", "result": "PASS",
                     "detail": f"{df.rows_out.sum()} rows in {wall:.2f}s wall"})
     if verbose:
@@ -115,7 +167,7 @@ def test_latency_breakdown(verbose: bool = True) -> pd.DataFrame:
     before it can be queried in Gold. Broken down by phase so the slow phase
     is visible rather than inferred.
     """
-    result, wall = _run_against("lowrox_s40", "/tmp/lake_perf_latency")
+    result, wall = _run_against(largest_scale_db(), "/tmp/lake_perf_latency")
     m = result.metrics.to_frame()
     phase = (m.groupby("layer", as_index=False)
                .agg(seconds=("duration_sec", "sum"), steps=("step", "count")))
@@ -143,8 +195,9 @@ def test_scaling_curve(verbose: bool = True) -> pd.DataFrame:
     scales; if it collapses, there is a per-row cost that will not survive
     production volume.
     """
+    scales = available_scales()
     rows = []
-    for label, db, size in SCALES:
+    for label, db, size in scales:
         result, wall = _run_against(db, f"/tmp/lake_perf_scale_{size}")
         m = result.metrics.to_frame()
         extracted = int(m[m.layer == "extract"].rows_out.sum())
@@ -160,6 +213,20 @@ def test_scaling_curve(verbose: bool = True) -> pd.DataFrame:
             "quarantined": result.dlq_rows,
         })
     df = pd.DataFrame(rows)
+
+    if len(df) < 2:
+        msg = ("Only one data volume is reachable, so there is no curve to plot.\n"
+               "The scaling test needs the same schema seeded at several sizes:\n"
+               "    python generate.py --scale 10   # then load 01+02 into lowrox_s10\n"
+               "    python generate.py --scale 40   # then load 01+02 into lowrox_s40\n"
+               "Run this against a local Postgres rather than your Supabase project:\n"
+               "three copies of the data in a hosted database is not worth the quota.")
+        RESULTS.append({"test": "scaling_curve", "result": "SKIP", "detail": msg.split(chr(10))[0]})
+        if verbose:
+            print("\nSCALING CURVE")
+            print(df.to_string(index=False))
+            print("\n" + msg)
+        return df
 
     # the pipeline scales if throughput does not fall away as volume grows
     first, last = df.rows_per_sec.iloc[0], df.rows_per_sec.iloc[-1]
@@ -183,7 +250,7 @@ def test_parallelism(verbose: bool = True) -> pd.DataFrame:
     """
     rows = []
     for workers in (1, 2, 4, 8):
-        result, wall = _run_against("lowrox_s40", f"/tmp/lake_perf_par_{workers}",
+        result, wall = _run_against(largest_scale_db(), f"/tmp/lake_perf_par_{workers}",
                                     workers=workers)
         m = result.metrics.to_frame()
         ex = m[m.layer == "extract"]
@@ -221,39 +288,61 @@ def test_parallelism_under_network_latency(verbose: bool = True) -> pd.DataFrame
     """
     import psycopg2 as _pg
     real_connect = _pg.connect
-    delay_ms = int(os.environ.get("LOWROX_SIM_LATENCY_MS", "60"))
+    # 200ms is what a Colab runtime actually sees against a free-tier pooler in
+    # another region (their project is in ap-south-1, Mumbai). At 60ms the
+    # effect is real but smaller than the run-to-run noise, which makes for a
+    # flaky test and a weak claim.
+    delay_ms = int(os.environ.get("LOWROX_SIM_LATENCY_MS", "200"))
 
     def slow_connect(*a, **kw):
         time.sleep(delay_ms / 1000.0)          # the network round trip
         return real_connect(*a, **kw)
 
+    db = largest_scale_db()
     rows = []
-    _pg.connect = slow_connect
-    try:
-        for workers in (1, 4, 8):
-            result, wall = _run_against("lowrox_s10", f"/tmp/lake_perf_net_{workers}",
-                                        workers=workers)
-            # extract.py resolves psycopg2.connect at call time, so the patch
-            # survives the module reload that _run_against performs
-            rows.append({"workers": workers, "wall_sec": round(wall, 3),
-                         "rows": int(result.metrics.to_frame()
-                                     .query("layer == 'extract'").rows_out.sum())})
-    finally:
-        _pg.connect = real_connect
+
+    # A controlled comparison, not a threshold plucked out of the air: the same
+    # database, the same worker counts, measured with and without the injected
+    # round trip. The claim being tested is "parallelism helps MORE when the
+    # source is far away", so the baseline has to be measured, not assumed.
+    for rtt, label in ((0, "localhost"), (delay_ms, f"{delay_ms}ms RTT")):
+        if rtt:
+            _pg.connect = slow_connect
+        try:
+            for workers in (1, 8):
+                result, wall = _run_against(db, f"/tmp/lake_perf_net_{rtt}_{workers}",
+                                            workers=workers)
+                # extract.py resolves psycopg2.connect at call time, so the
+                # patch survives the module reload _run_against performs
+                rows.append({"condition": label, "simulated_rtt_ms": rtt,
+                             "workers": workers, "wall_sec": round(wall, 3),
+                             "rows": int(result.metrics.to_frame()
+                                         .query("layer == 'extract'").rows_out.sum())})
+        finally:
+            _pg.connect = real_connect
 
     df = pd.DataFrame(rows)
-    df["speedup_vs_1"] = (df.wall_sec.iloc[0] / df.wall_sec).round(2)
-    df.insert(0, "simulated_rtt_ms", delay_ms)
-    gain = float(df.speedup_vs_1.max())
+    df["speedup_8_vs_1"] = df.groupby("condition").wall_sec.transform(
+        lambda s: (s.iloc[0] / s).round(2))
+    gains = df[df.workers == 8].set_index("condition").speedup_8_vs_1
+    local_gain, net_gain = float(gains["localhost"]), float(gains[f"{delay_ms}ms RTT"])
+
+    # the finding is the DIFFERENCE between the two conditions
+    ok = net_gain > local_gain * 1.15
     RESULTS.append({"test": "parallelism_under_network_latency",
-                    "result": "PASS" if gain > 1.5 else "FAIL",
-                    "detail": f"{gain:.2f}x speedup at {delay_ms}ms simulated RTT "
-                              f"(vs ~1.0x on localhost)"})
+                    "result": "PASS" if ok else "FAIL",
+                    "detail": f"8 workers buy {local_gain:.2f}x on localhost and "
+                              f"{net_gain:.2f}x at {delay_ms}ms RTT"})
     if verbose:
-        print(f"\nPARALLEL EXTRACTION WITH {delay_ms}ms SIMULATED NETWORK LATENCY")
+        print(f"\nPARALLEL EXTRACTION, SAME DATA, WITH AND WITHOUT A {delay_ms}ms ROUND TRIP")
         print(df.to_string(index=False))
-        print("On localhost parallelism buys nothing; across a network it buys "
-              f"{gain:.1f}x. This is why max_workers is a configuration value.")
+        print(f"\n8 workers are worth {local_gain:.2f}x on localhost and "
+              f"{net_gain:.2f}x once the source is {delay_ms}ms away.")
+        print("The absolute speedup matters less than the gap between those two\n"
+              "numbers: it is the round trip that parallelism hides, and there is\n"
+              "no round trip to hide on the same machine. Supabase is not on the\n"
+              "same machine, which is why max_workers is a configuration value\n"
+              "and not a constant.")
     return df
 
 
@@ -263,7 +352,7 @@ def test_incremental_is_cheaper(verbose: bool = True) -> pd.DataFrame:
     cost a small fraction of a full load. If it does not, the watermark is
     not actually filtering.
     """
-    result_init, wall_init = _run_against("lowrox_s40", "/tmp/lake_perf_incr")
+    result_init, wall_init = _run_against(largest_scale_db(), "/tmp/lake_perf_incr")
     # second run, nothing changed in the source
     import etl
     t0 = time.perf_counter()

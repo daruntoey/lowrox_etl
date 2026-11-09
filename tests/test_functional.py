@@ -22,9 +22,10 @@ from deltalake import DeltaTable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from etl.config import (GOLD, KEY_INVALID, KEY_NOT_APPLICABLE, KEY_UNKNOWN,
-                        SILVER, SOURCE_DSN, SOURCE_TABLES, TABLES_BY_NAME)
+                        SILVER, SOURCE_TABLES, TABLES_BY_NAME, source_dsn)
 from etl.errors import DeadLetterQueue
 from etl.lineage import LineageRegistry
+from etl.preflight import connect as _connect, require_gold
 
 RESULTS: list[dict] = []
 
@@ -36,7 +37,7 @@ def check(name: str, passed: bool, detail: str = "", category: str = ""):
 
 
 def _sql(query: str, params=()) -> pd.DataFrame:
-    with psycopg2.connect(SOURCE_DSN) as conn, conn.cursor() as cur:
+    with _connect() as conn, conn.cursor() as cur:
         cur.execute(query, params)
         return pd.DataFrame(cur.fetchall(), columns=[d[0] for d in cur.description])
 
@@ -65,8 +66,8 @@ def test_row_level_lineage_walk(verbose: bool = True) -> dict:
         -> _src_pk
     OLTP.txn_workout_summaries.id
     """
+    require_gold("fct_workout_session")
     fact = _delta(GOLD / "fct_workout_session")
-    assert len(fact), "fct_workout_session is empty — run the pipeline first"
 
     row = fact.sort_values("workout_id").iloc[len(fact) // 2]
     lineage_id = row["_src_lineage_id"]
@@ -347,6 +348,7 @@ def test_end_to_end():
 
 # ==========================================================================
 def run_all(verbose: bool = True) -> pd.DataFrame:
+    require_gold("fct_workout_session")
     RESULTS.clear()
     walk = test_row_level_lineage_walk(verbose=verbose)
     test_run_level_lineage_complete()

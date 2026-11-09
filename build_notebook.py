@@ -82,41 +82,218 @@ if IN_COLAB:
                    check=True)
 
 # ------------------------------------------------------------- the package
-# Three ways to get the etl/ package into the runtime. Pick one.
-#
-# A. (recommended) push this project to your own GitHub repo, then:
-#       !git clone https://github.com/<you>/lowrox-etl.git
-#       PROJECT_DIR = "/content/lowrox-etl"
-#
-# B. upload lowrox_etl.zip through the Colab file browser, then:
-#       !unzip -oq lowrox_etl.zip -d /content
-#       PROJECT_DIR = "/content/lowrox_etl"
-#
-# C. running locally: point at the folder you already have.
-PROJECT_DIR = os.environ.get("LOWROX_PROJECT_DIR", os.getcwd())
-sys.path.insert(0, PROJECT_DIR)
+# This notebook cannot run on its own: it needs the etl/ AND tests/ folders.
+# Set the two values below and nothing else — every other path is derived from
+# them, so the folder name can never end up disagreeing with itself.
+import glob, zipfile
+
+GITHUB_REPO = "https://github.com/daruntoey/lowrox_etl.git"   # None to skip cloning
+CLONE_INTO  = "/content/lowrox_etl"
+
+if IN_COLAB and GITHUB_REPO and not os.path.isdir(CLONE_INTO):
+    # subprocess takes a LIST, so the URL and the target cannot be glued into
+    # one argument. Written as a shell line (!git clone A B) a missing space
+    # silently makes it one URL, and a failed !git clone does not raise in a
+    # notebook, so the cell carries on as though the clone had worked.
+    r = subprocess.run(["git", "clone", "--depth", "1", GITHUB_REPO, CLONE_INTO],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr.strip())
+        print("\nClone failed. If the repo is private, Colab has no credentials for\n"
+              "it — either make it public, or upload lowrox_etl.zip with the folder\n"
+              "icon on the left and re-run this cell (the zip is picked up below).")
+
+def find_project() -> str:
+    """Locate the folder that actually contains etl/config.py."""
+    for cand in (CLONE_INTO, "/content/lowrox_etl", os.getcwd(),
+                 os.path.join(os.getcwd(), "lowrox_etl")):
+        if os.path.isfile(os.path.join(cand, "etl", "config.py")):
+            return os.path.abspath(cand)
+    for z in glob.glob("/content/*.zip") + glob.glob("*.zip"):
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall("/content" if IN_COLAB else ".")
+        print(f"unpacked {os.path.basename(z)}")
+    for hit in (glob.glob("/content/**/etl/config.py", recursive=True)
+                + glob.glob("./**/etl/config.py", recursive=True)):
+        return os.path.abspath(os.path.dirname(os.path.dirname(hit)))
+    print("\n" + "=" * 72)
+    print("COULD NOT FIND etl/config.py ANYWHERE")
+    print("=" * 72)
+    print("  Colab : upload lowrox_etl.zip with the folder icon on the left,")
+    print("          then re-run this cell — it will unpack it for you")
+    print("  Local : start Jupyter from inside the lowrox_etl folder")
+    print("=" * 72)
+    raise RuntimeError("etl/ package not found — see the message above")
+
+PROJECT_DIR = os.environ.get("LOWROX_PROJECT_DIR") or find_project()
+TESTS_DIR = os.path.join(PROJECT_DIR, "tests")
+for _p in (PROJECT_DIR, TESTS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+assert os.path.isfile(os.path.join(TESTS_DIR, "test_functional.py")), \
+    f"found etl/ at {PROJECT_DIR} but no tests/ beside it — the checkout is incomplete"
 
 # ------------------------------------------------------------ connection
-# SUPABASE: paste your session-pooler string here.
+# SUPABASE — paste your SESSION POOLER string (see the table above):
 #   postgresql://postgres.<ref>:<password>@aws-<n>-<region>.pooler.supabase.com:5432/postgres
-# Keep the password out of the notebook you submit — read it from an env var
-# or Colab's secrets manager instead of typing it into a cell.
-os.environ.setdefault(
-    "LOWROX_SOURCE_DSN",
-    "postgresql://lowrox:lowrox@localhost:5432/lowrox",   # local test database
-)
+#
+# Better: put it in Colab's secrets panel (the key icon) as SUPABASE_DSN, so the
+# password never appears in the notebook you hand in.
+DSN = os.environ.get("LOWROX_SOURCE_DSN")
+if not DSN and IN_COLAB:
+    try:
+        from google.colab import userdata
+        DSN = userdata.get("SUPABASE_DSN")
+    except Exception:
+        pass
+if not DSN:
+    DSN = "postgresql://lowrox:lowrox@localhost:5432/lowrox"   # local test database
+os.environ["LOWROX_SOURCE_DSN"] = DSN
 
-# Where Bronze / Silver / Gold are written. On Colab, mount Drive and use a
-# Drive path if you want the lake to survive a disconnect.
-os.environ.setdefault("LOWROX_LAKE_ROOT", "/home/claude/lowrox_lake")
+# Colab has no /home/claude, and its disk is wiped on disconnect. Either run
+# this notebook top to bottom in one session — it does init AND incremental in
+# one pass, so that is enough — or mount Drive and point this at a Drive folder.
+os.environ.setdefault(
+    "LOWROX_LAKE_ROOT",
+    "/content/lowrox_lake" if IN_COLAB else os.path.join(PROJECT_DIR, "lowrox_lake"))
 
 import pandas as pd
 pd.set_option("display.width", 200, "display.max_columns", 40)
 
+# If etl was imported earlier in this kernel — a previous run of this cell,
+# before the connection string was set — its module-level paths are frozen at
+# the OLD values. The symptom is nasty: this cell's own connection test passes
+# while the pipeline quietly keeps using the previous database or lake folder.
+# Reloading costs nothing and removes the whole class of problem.
+import importlib
+for _m in ("etl.config", "etl.metrics", "etl.lineage", "etl.errors", "etl.faults",
+           "etl.preflight", "etl.extract", "etl.transform", "etl.load",
+           "etl.pipeline", "etl"):
+    if _m in sys.modules:
+        importlib.reload(sys.modules[_m])
+
 from etl import run_pipeline, reset_lake, FaultInjector, FAULT_CATALOGUE, SOURCE_TABLES
-print(f"ready — {len(SOURCE_TABLES)} source tables registered")
-print(f"source : {os.environ['LOWROX_SOURCE_DSN'].split('@')[-1]}")
-print(f"lake   : {os.environ['LOWROX_LAKE_ROOT']}")
+
+# The notebook and the package arrive by different routes — the notebook is
+# downloaded, the package is cloned — so they can drift apart without anything
+# complaining. A new notebook running last week's package produces errors that
+# point at the wrong thing entirely, so check it here.
+EXPECTED_ETL_VERSION = "2026.11.10"
+import etl as _etl
+_have = getattr(_etl, "__version__", "0 (pre-versioning)")
+if _have < EXPECTED_ETL_VERSION:
+    print("=" * 72)
+    print("THE etl/ PACKAGE IS OLDER THAN THIS NOTEBOOK")
+    print("=" * 72)
+    print(f"  notebook expects : {EXPECTED_ETL_VERSION}")
+    print(f"  package found    : {_have}")
+    print(f"  loaded from      : {os.path.dirname(_etl.__file__)}")
+    print()
+    print("The notebook was downloaded but the package came from your GitHub")
+    print("repo, which has not been updated. Everything will fail in confusing")
+    print("ways until they match. Do one of these:")
+    print()
+    print("  push the new files to GitHub, then in Colab:")
+    print(f"      !rm -rf {CLONE_INTO}")
+    print("      (re-run this cell — it will clone again)")
+    print()
+    print("  or skip GitHub entirely: set GITHUB_REPO = None at the top of")
+    print("  this cell, upload lowrox_etl.zip with the folder icon, and re-run.")
+    print("=" * 72)
+    raise RuntimeError(f"etl package {_have} is older than the required "
+                       f"{EXPECTED_ETL_VERSION}")
+
+# Fail HERE, loudly. run_pipeline() catches its own exceptions and returns
+# ok=False rather than raising, so a run against an unreachable database
+# prints errors and carries on — and every later cell then fails for reasons
+# that look unrelated. Checking the connection now avoids that whole mess.
+import psycopg2
+from urllib.parse import urlparse
+
+# Supabase hands you the string with the password written as [YOUR-PASSWORD],
+# square brackets and all, so the placeholder check has to know that shape too.
+_PLACEHOLDERS = ("<ref>", "<password>", "<pw>", "[your-password]",
+                 "your-password", "[password]", "[yourpassword]")
+if any(p in DSN.lower() for p in _PLACEHOLDERS):
+    raise RuntimeError(
+        "The connection string still contains a placeholder. Replace it with "
+        "your real database password (brackets removed), or add SUPABASE_DSN "
+        "to Colab's secrets panel.")
+
+# A password containing # / ? @ : % breaks URL parsing, and it breaks it
+# QUIETLY — the host comes out as something like 'postgres.ref' and the error
+# that follows says nothing about passwords. Catch it here instead.
+_u = urlparse(DSN)
+try:
+    # .port is what actually trips: a password containing # / ? or @ pushes
+    # part of the password into the port position, so urlparse hands back
+    # something like port='ab'. Reading it is the detection.
+    _host, _port = _u.hostname, _u.port
+except ValueError:
+    _host, _port = None, None
+if not _host:
+    raise RuntimeError(
+        "The connection string does not parse into a host and port.\n"
+        "This is almost always a password containing one of  # / ? @ : %\n"
+        "Percent-encode it instead of pasting it raw:\n"
+        "    from urllib.parse import quote\n"
+        "    PW = 'your password'\n"
+        "    DSN = ('postgresql://postgres.<ref>:' + quote(PW, safe='')\n"
+        "           + '@<host>.pooler.supabase.com:5432/postgres')")
+if "pooler.supabase.com" in DSN and _port == 6543:
+    print("NOTE: port 6543 is the TRANSACTION pooler, which drops session "
+          "state between\n      transactions. Use port 5432 (session pooler) "
+          "for an ETL job.\n")
+try:
+    with psycopg2.connect(os.environ["LOWROX_SOURCE_DSN"], connect_timeout=15) as _c:
+        with _c.cursor() as _cur:
+            _cur.execute("SELECT count(*) FROM ms_users")
+            _n = _cur.fetchone()[0]
+except Exception as exc:
+    # SystemExit inside IPython trips a traceback-formatting bug in Colab, which
+    # buries the useful part under three unrelated tracebacks. Print first, then
+    # raise something short that renders normally.
+    host = DSN.split("@")[-1]
+    print("\n" + "=" * 72)
+    print("CANNOT REACH THE SOURCE DATABASE")
+    print("=" * 72)
+    print(f"tried  : {host}")
+    print(f"error  : {type(exc).__name__}: {str(exc).strip().splitlines()[0]}")
+    print()
+    if "localhost" in host or "127.0.0.1" in host:
+        print("You are still pointed at localhost. On Colab that is the Colab")
+        print("machine itself, and there is no PostgreSQL running on it. Supply")
+        print("your Supabase connection string:")
+        print()
+        print("  1. Supabase -> your project -> Connect -> Connection string")
+        print("  2. choose SESSION POOLER (port 5432) and copy the whole line")
+        print("  3. Colab: key icon in the left sidebar -> Add new secret")
+        print("       Name   SUPABASE_DSN")
+        print("       Value  postgresql://postgres.<ref>:<pw>"
+              "@aws-<n>-<region>.pooler.supabase.com:5432/postgres")
+        print("     turn Notebook access ON, then re-run this cell")
+        print()
+        print("  Or set it directly, just above the DSN lines in this cell:")
+        print("       os.environ['LOWROX_SOURCE_DSN'] = 'postgresql://...'")
+    elif "supabase" in host and "pooler" not in host:
+        print("That is the DIRECT connection (db.<ref>.supabase.co), which is")
+        print("IPv6-only on Free and Pro. Colab has no IPv6, so it can never")
+        print("reach it. Use the SESSION POOLER instead, on port 5432:")
+        print("  postgresql://postgres.<ref>:<pw>"
+              "@aws-<n>-<region>.pooler.supabase.com:5432/postgres")
+    else:
+        print("Check the password, and that you copied the SESSION pooler line")
+        print("(port 5432) and not the transaction pooler (port 6543).")
+    print("=" * 72)
+    raise RuntimeError("source database unreachable — see the message above") from None
+
+print(f"ready — {len(SOURCE_TABLES)} source tables registered, {_n} users in the source")
+print(f"project : {PROJECT_DIR}")
+print(f"tests   : {TESTS_DIR}")
+print(f"source  : {os.environ['LOWROX_SOURCE_DSN'].split('@')[-1]}")
+print(f"lake    : {os.environ['LOWROX_LAKE_ROOT']}")
+print(f"colab   : {IN_COLAB}")
 ''')
 
 # --------------------------------------------------------------------------
@@ -198,6 +375,19 @@ init = run_pipeline("init", echo=False)
 print(init, "\n")
 print("THROUGHPUT BY LAYER")
 print(init.summary().to_string(index=False))
+
+# run_pipeline REPORTS failures, it does not raise them — a run against an
+# unreachable or empty source prints its errors and returns ok=False. Without
+# this check the notebook would carry on to Part 3 with an empty lake, and
+# every test there would fail for a reason that has nothing to do with the
+# tests. Stop here instead.
+from etl import diagnose
+if not init.ok or init.metrics.rows_landed == 0:
+    diagnose()
+    raise RuntimeError(
+        "The init load did not complete. Read the state report above — it "
+        "names the cause — and fix it before running Part 3.")
+print("\ninit load OK — Gold is populated, Part 3 can run")
 ''')
 
 code(r'''
@@ -249,7 +439,13 @@ the OLTP database, checking the measures survived every hop.
 """)
 
 code(r'''
-sys.path.insert(0, os.path.join(PROJECT_DIR, "tests"))
+# TESTS_DIR was already put on sys.path by the setup cell.
+#
+# If this cell raises "Gold table 'fct_workout_session' is empty", the message
+# names which of the four possible causes it is — the pipeline never ran, the
+# source is empty, the source is unreachable, or the quality gate rejected
+# everything — and what to do about each. The usual cause is simply running
+# this cell without having run Part 2 in the same session.
 import test_functional as F
 
 walk = F.test_row_level_lineage_walk()
@@ -326,6 +522,12 @@ Three things have to be true, and the third is the one most pipelines get wrong:
 
 code(r'''
 import test_incremental as I
+
+# This part WRITES to the source: it inserts workouts and payments, upgrades
+# two members, then deletes its own rows. Fine against seeded mock data, not
+# fine against a project with real members — so it has to be opted into.
+os.environ["LOWROX_ALLOW_SOURCE_WRITES"] = "1"
+
 demo = I.run_demo(verbose=True)
 ''')
 
@@ -370,21 +572,25 @@ code(r'''
 %matplotlib inline
 import matplotlib.pyplot as plt
 
-fig, ax = plt.subplots(1, 2, figsize=(11, 3.6))
-ax[0].plot(scale.source_rows, scale.rows_per_sec, marker="o", color="#2563eb")
-ax[0].set_xscale("log"); ax[0].set_xlabel("source rows"); ax[0].set_ylabel("rows / second")
-ax[0].set_title("Throughput improves with volume")
-ax[0].grid(alpha=.3)
+if len(scale) < 2:
+    print("Only one data volume was reachable, so there is no curve to draw.\n"
+          "See the note printed by test_scaling_curve() just above.")
+else:
+  fig, ax = plt.subplots(1, 2, figsize=(11, 3.6))
+  ax[0].plot(scale.source_rows, scale.rows_per_sec, marker="o", color="#2563eb")
+  ax[0].set_xscale("log"); ax[0].set_xlabel("source rows"); ax[0].set_ylabel("rows / second")
+  ax[0].set_title("Throughput improves with volume")
+  ax[0].grid(alpha=.3)
 
-bottom = 0
-for col, colour, label in [("extract_sec", "#2563eb", "extract"),
-                           ("silver_sec", "#10b981", "silver"),
-                           ("gold_sec", "#f59e0b", "gold")]:
-    ax[1].bar(scale.dataset, scale[col], bottom=bottom, color=colour, label=label)
-    bottom = bottom + scale[col]
-ax[1].set_ylabel("seconds"); ax[1].set_title("Where the time goes")
-ax[1].legend(); ax[1].tick_params(axis="x", rotation=15); ax[1].grid(alpha=.3, axis="y")
-plt.tight_layout(); plt.show()
+  bottom = 0
+  for col, colour, label in [("extract_sec", "#2563eb", "extract"),
+                             ("silver_sec", "#10b981", "silver"),
+                             ("gold_sec", "#f59e0b", "gold")]:
+      ax[1].bar(scale.dataset, scale[col], bottom=bottom, color=colour, label=label)
+      bottom = bottom + scale[col]
+  ax[1].set_ylabel("seconds"); ax[1].set_title("Where the time goes")
+  ax[1].legend(); ax[1].tick_params(axis="x", rotation=15); ax[1].grid(alpha=.3, axis="y")
+  plt.tight_layout(); plt.show()
 
 print("""Throughput RISES as the data grows, which looks wrong and is not. The
 fixed cost per run — eighteen connections, eighteen Delta table creations,
@@ -399,13 +605,25 @@ net = P.test_parallelism_under_network_latency()
 ''')
 
 md(r"""
-Parallel extraction buys almost nothing against a database on the same machine
-(1.0×) and 1.8× once a realistic 60 ms round trip is in the way. That is the
-honest result, and it is the one that matters, because Supabase in Singapore is
-a network hop away from wherever this runs. The lesson is not "parallelism is
-useless" but "`max_workers` is a configuration value, and the right setting
-depends on where the source lives" — which is why it is a config field and not
-a constant.
+Read the second table as a controlled comparison rather than as a headline
+number: the same data, the same worker counts, measured with and without an
+injected round trip. On localhost extra workers make things slightly *worse* —
+there is no network wait to hide, so the threads only contend. Once the source
+is 200 ms away the same workers come out ahead. That figure is not arbitrary:
+a Colab runtime reaching a free-tier pooler in another region — `ap-south-1`,
+Mumbai, in this project's case — pays roughly that per connection, and the
+pipeline opens one per table.
+
+The gap between those two conditions is the finding, not either number on its
+own, and the absolute effect here is modest because at 2,000 rows per table the
+time spent transferring rows outweighs the one connection each table pays for.
+With more tables, or fewer rows in each, the fixed per-connection cost
+dominates and the gap widens.
+
+What this settles is that `max_workers` is a configuration value whose right
+setting depends on where the source lives — Supabase in Singapore is a network
+hop away from wherever this notebook runs, and localhost is not. It is a config
+field for that reason, not a constant.
 """)
 
 code(r'''

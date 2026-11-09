@@ -23,7 +23,8 @@ from deltalake import DeltaTable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from etl import reset_lake, run_pipeline
-from etl.config import GOLD, SILVER, SOURCE_DSN, TABLES_BY_NAME
+from etl.config import GOLD, SILVER, TABLES_BY_NAME, source_dsn
+from etl.preflight import connect as _connect
 from etl.extract import read_watermarks
 
 RESULTS: list[dict] = []
@@ -47,13 +48,13 @@ def _gold(name: str) -> pd.DataFrame:
 def _exec(sql: str, params=None):
     # psycopg2 treats % as a placeholder whenever params is supplied, even an
     # empty tuple, which breaks any LIKE 'x%' literal. Pass None instead.
-    with psycopg2.connect(SOURCE_DSN) as conn, conn.cursor() as cur:
+    with _connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params) if params else cur.execute(sql)
         conn.commit()
 
 
 def _scalar(sql: str):
-    with psycopg2.connect(SOURCE_DSN) as conn, conn.cursor() as cur:
+    with _connect() as conn, conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchone()[0]
 
@@ -65,7 +66,7 @@ def busiest_users(n: int = 2) -> list[int]:
     rows to point at. Hard-coding user 1 and 2 would test nothing: in this
     dataset neither of them has ever recorded a session.
     """
-    with psycopg2.connect(SOURCE_DSN) as conn, conn.cursor() as cur:
+    with _connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT user_id FROM txn_workout_summaries "
                     "GROUP BY 1 ORDER BY count(*) DESC LIMIT %s", (n,))
         return [r[0] for r in cur.fetchall()]
@@ -143,8 +144,34 @@ def revert_source_changes():
 
 
 # --------------------------------------------------------------------------
+def _guard_source_writes():
+    """
+    This demo WRITES to the source database: it inserts workouts and payments,
+    updates two members' tier, and deletes its own rows afterwards. That is
+    harmless against seeded mock data and is not harmless against a database
+    with real members in it, so anything that is not obviously a local test
+    database has to be opted into explicitly.
+    """
+    import os
+    dsn = os.environ.get("LOWROX_SOURCE_DSN", "")
+    is_local = any(h in dsn for h in ("@localhost", "@127.0.0.1", "@db:", "@postgres:"))
+    if is_local or os.environ.get("LOWROX_ALLOW_SOURCE_WRITES") == "1":
+        return
+    print(
+        "Refusing to run: this demo writes to the source database.\n\n"
+        f"  target: {dsn.split('@')[-1] or '(unset)'}\n\n"
+        "It inserts 7 workouts and 3 payments, upgrades two members to elite,\n"
+        "and deletes its own rows at the end. Against seeded mock data that is\n"
+        "fine. Against a project with real members it is not.\n\n"
+        "If this database holds only mock data, opt in:\n"
+        "    os.environ['LOWROX_ALLOW_SOURCE_WRITES'] = '1'\n\n"
+        "Otherwise point LOWROX_SOURCE_DSN at a local copy and run it there.")
+    raise RuntimeError("source writes not permitted — see the message above")
+
+
 def run_demo(verbose: bool = True) -> dict:
     RESULTS.clear()
+    _guard_source_writes()
     revert_source_changes()
 
     # ---- phase 1: init ---------------------------------------------------

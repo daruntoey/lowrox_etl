@@ -38,6 +38,42 @@ class SourceUnavailable(TransientError):
     pass
 
 
+class AuthenticationError(PipelineError):
+    """
+    Wrong password, wrong username, or no permission.
+
+    NEVER retried. Retrying a bad credential cannot succeed, and against a
+    pooled database it does real harm: Supabase's Supavisor trips a circuit
+    breaker after 10 authentication failures in a 150-second window and then
+    blocks the origin IP for 120 seconds. Eighteen tables times three retries
+    is 54 attempts in a few seconds, which trips it every time and extends the
+    lockout on each run. Fail on the first one instead.
+    """
+    retryable = False
+
+
+class CircuitBreakerOpen(PipelineError):
+    """The pooler is already refusing connections. Waiting is the only fix."""
+    retryable = False
+
+
+def classify_connection_error(exc: Exception) -> PipelineError:
+    """
+    Turn a driver error into the right kind of pipeline error, because the
+    retry decision depends entirely on which kind it is.
+    """
+    text = str(exc).lower()
+    if "circuit breaker" in text or "ecircuitbreaker" in text:
+        return CircuitBreakerOpen(str(exc))
+    if ("password authentication failed" in text
+            or "authentication failures" in text
+            or "tenant or user not found" in text
+            or "role" in text and "does not exist" in text
+            or "no pg_hba.conf entry" in text):
+        return AuthenticationError(str(exc))
+    return SourceUnavailable(str(exc))
+
+
 class TargetUnavailable(TransientError):
     pass
 

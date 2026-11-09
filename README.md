@@ -44,13 +44,66 @@ Drive folder.
 
 ### Colab, step by step
 
-1. Push this folder to a GitHub repo of your own.
-2. New Colab notebook → `!git clone https://github.com/<you>/lowrox-etl.git`
-3. Open `lowrox_etl_demo.ipynb` from the clone, set `PROJECT_DIR`, put your
-   connection string in the setup cell, Runtime → Run all.
+**GitHub is optional.** The setup cell finds the package on its own — it looks
+for an `etl/` folder next to the notebook, and failing that unpacks any `.zip`
+it finds. Two routes:
 
-If you would rather not use GitHub, zip the folder, upload it through the Colab
-file browser and `!unzip -oq lowrox_etl.zip -d /content`.
+**Route A — GitHub (the setup cell is already pointed at it).**
+
+The cell clones `GITHUB_REPO` into `CLONE_INTO` and derives every other path
+from those two values, so a folder name can never end up disagreeing with
+itself. Change them if your repo is named differently:
+
+```python
+GITHUB_REPO = "https://github.com/daruntoey/lowrox_etl.git"
+CLONE_INTO  = "/content/lowrox_etl"
+```
+
+The repo must be **public** — Colab has no credentials for a private one. If the
+clone fails the cell says so and falls through to Route B automatically.
+
+**Route B — upload the zip (no GitHub needed).**
+
+1. [colab.research.google.com](https://colab.research.google.com) → **File → Upload
+   notebook** → choose `lowrox_etl_demo.ipynb`.
+2. Click the **folder icon** in the left sidebar → upload `lowrox_etl.zip`.
+3. Put your Supabase connection string in the setup cell (or add `SUPABASE_DSN`
+   to Colab's secrets, the key icon).
+4. **Runtime → Run all.**
+
+Set `GITHUB_REPO = None` to skip the clone attempt. The cell finds and unpacks
+the zip by itself. Nothing else to edit.
+
+**Pushing to GitHub in the first place**
+
+On Windows, from the folder you keep it in:
+
+```bat
+cd C:\Users\1000258745\Documents\lowrox_etl
+git init
+git add .
+git commit -m "Lowrox ETL pipeline with functional, performance and error-handling tests"
+git branch -M main
+git remote add origin https://github.com/<your-username>/lowrox-etl.git
+git push -u origin main
+```
+
+Create the repo on github.com **empty** first — no README, no .gitignore, no
+licence — or the first push is rejected for having unrelated histories. A
+`.gitignore` is already in the folder and keeps `__pycache__/`, `lowrox_lake/`
+and `*.zip` out of the repo.
+
+The seed data is synthetic, so a public repo leaks nothing — but keep your
+Supabase password out of it regardless.
+
+### If a cell fails in Colab
+
+| Symptom | Cause |
+| --- | --- |
+| `ModuleNotFoundError: No module named 'test_functional'` | the clone or unzip did not land where `PROJECT_DIR` points. The setup cell now derives both, so re-run it — and **Runtime → Restart session** first, because a stale `sys.path` from an earlier run makes the problem look intermittent. |
+| Part 2 prints `[COMPLETED WITH ERRORS]` | the source database was unreachable. `run_pipeline()` catches its own exceptions and returns `ok=False` instead of raising, so the run does not stop — everything after it then fails for reasons that look unrelated. The setup cell now tests the connection first. |
+| the connection times out against Supabase | you are using the direct connection, which is IPv6-only. Use the session pooler. |
+| `git clone` prints `Repository not found` | the repo is private, or the name is wrong. Make it public or use Route B. |
 
 ---
 
@@ -141,9 +194,16 @@ Two results worth knowing before you read the numbers:
 - **Throughput rises with volume** (1,005 → 12,443 rows/s). The fixed cost of a
   run — 18 connections, 18 Delta table creations, 18 commits — dominates at 856
   rows. Quote the large number; the small one measures setup, not work.
-- **Parallelism buys nothing locally** (1.0×) and **1.8× at a 60 ms round trip**.
-  The separate networked test demonstrates this rather than asserting it, which
-  matters because Supabase is a network hop away and localhost is not.
+- **Parallelism slightly *hurts* locally and helps across a network.** The
+  networked test is a controlled comparison — same data, same worker counts,
+  measured with and without an injected 200 ms round trip. On localhost there is
+  no network wait to hide, so extra workers only contend; once the source is a
+  hop away they come out ahead. The gap between the two conditions is the
+  finding, not either number alone. This matters because Supabase is a network
+  hop away and localhost is not.
+
+All performance figures are single-run measurements on one machine. The shapes
+are meaningful; the absolute rates are not transferable.
 
 ### Error handling — 6 live simulations
 
@@ -167,6 +227,15 @@ Silver (deduplicated)           45            45
 ```
 
 ### init vs incremental — 6 checks
+
+> **This suite writes to the source database.** It inserts 7 workouts and 3
+> payments, upgrades two members to elite, and deletes its own rows at the end.
+> Against seeded mock data that is fine; against a project with real members it
+> is not, so anything that is not obviously a local database has to be opted
+> into with `LOWROX_ALLOW_SOURCE_WRITES=1`. The notebook sets that flag, because
+> at the moment your Supabase holds only generated data. Remove it once real
+> users exist.
+
 
 Init reads all 856 rows and records a watermark per table. The source then gains
 7 workouts and 3 payments and two members upgrade tier; the incremental run reads
@@ -206,3 +275,29 @@ run a periodic full reconciliation; or move to log-based CDC reading the
 write-ahead log, which cannot be fooled by an application clock. Only the last
 one is a real fix, and it changes extraction only — nothing downstream of Bronze
 would have to change.
+
+### Supabase: the circuit breaker
+
+If a run fails with
+
+```
+FATAL: (ECIRCUITBREAKER) too many authentication failures,
+       new connections are temporarily blocked
+```
+
+the password is wrong. Supavisor trips this after **10 authentication failures
+in a 150-second window** and blocks the origin IP for **120 seconds**; every
+further attempt with the bad credential re-triggers it, so the lockout extends.
+
+Stop running cells, wait two full minutes, then fix the credential:
+
+1. the pooler username is `postgres.<project-ref>`, not plain `postgres`
+2. the password is the **database** password, not your Supabase account
+   password — Settings → Database → Reset database password
+3. percent-encode it if it contains `# / ? @ : %`
+
+The pipeline no longer contributes to this. An authentication failure is
+classified as non-retryable and aborts the whole extraction phase on the first
+occurrence, so one bad password costs about five connection attempts instead of
+fifty-four. That change is in `etl/errors.py` (`classify_connection_error`) and
+`etl/extract.py`.

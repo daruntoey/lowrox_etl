@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import BRONZE, CONTROL, GOLD, LAKE_ROOT, SILVER, RunConfig
+from .config import BRONZE, CONTROL, GOLD, LAKE_ROOT, SILVER, RunConfig, source_dsn
 from .errors import Alerter, DeadLetterQueue, ErrorLog
 from .extract import extract_all, read_watermarks, reset_watermarks
 from .lineage import LineageRegistry, new_run_id
@@ -101,8 +101,20 @@ def run_pipeline(load_type: str = "init", *, tables: tuple[str, ...] = (),
     failed_steps = [s for s in metrics.steps if s.status == "failed"]
     if failed_steps:
         ok = False
-        alerts.fire("critical", f"{len(failed_steps)} step(s) failed",
-                    "\n".join(f"  {s.layer}.{s.step}: {s.error}" for s in failed_steps))
+        # One connection problem fails every table with the same message.
+        # Group by the error so the alert names the cause once and lists the
+        # tables it hit, rather than printing the same paragraph 18 times.
+        grouped: dict[str, list[str]] = {}
+        for s in failed_steps:
+            key = (s.error or "").strip().splitlines()[0][:160]
+            grouped.setdefault(key, []).append(f"{s.layer}.{s.step}")
+        detail = []
+        for err, steps in grouped.items():
+            shown = ", ".join(steps[:4]) + (f" and {len(steps) - 4} more" if len(steps) > 4 else "")
+            detail.append(f"  {err}\n    affected: {shown}")
+        alerts.fire("critical",
+                    f"{len(failed_steps)} step(s) failed, {len(grouped)} distinct cause(s)",
+                    "\n".join(detail))
     if dlq.count:
         sev = "critical" if dlq.count > 0.05 * max(1, sum(s.rows_in for s in metrics.steps)) else "warning"
         alerts.fire(sev, f"{dlq.count} row(s) quarantined",
@@ -111,6 +123,29 @@ def run_pipeline(load_type: str = "init", *, tables: tuple[str, ...] = (),
     metrics.persist()
     log.stage = "done"
     log.info(f"finished in {metrics.total_seconds:.2f}s")
+
+    # A run that fails with echo=False used to print a row count of zero and
+    # nothing else, hiding the one thing worth reading. Distinct errors are
+    # always shown, whatever echo says.
+    if not ok:
+        seen, errors = set(), []
+        for ev in log.events:
+            if ev.level == "ERROR" and ev.message not in seen:
+                seen.add(ev.message)
+                errors.append(ev.message)
+        if errors:
+            print("\n" + "=" * 72)
+            print(f"ERRORS IN RUN {run_id}  ({len(errors)} distinct)")
+            print("=" * 72)
+            for e in errors[:10]:
+                print(f"  {e}")
+            if len(errors) > 10:
+                print(f"  ... and {len(errors) - 10} more")
+            print(f"\nconfig is reading the source as: {source_dsn().split('@')[-1]}")
+            print("If that is not the database you set in Part 0, the etl package "
+                  "was\nimported before the environment variable was set. "
+                  "Runtime -> Restart\nsession, then run Part 0 again.")
+            print("=" * 72)
 
     return RunResult(run_id=run_id, load_type=load_type, ok=ok, extract=extract_df,
                      silver=silver_df, gold=gold_result, metrics=metrics,

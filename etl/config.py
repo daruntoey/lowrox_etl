@@ -20,10 +20,26 @@ from pathlib import Path
 #   user  postgres.<project-ref>
 # The direct connection db.<ref>.supabase.co is IPv6-only on Free/Pro, and
 # Google Colab has no IPv6, so it will simply time out.
-SOURCE_DSN = os.environ.get(
-    "LOWROX_SOURCE_DSN",
-    "postgresql://postgres@localhost:5432/lowrox",
-)
+_DEFAULT_DSN = "postgresql://postgres@localhost:5432/lowrox"
+
+
+def source_dsn() -> str:
+    """
+    Read the connection string EVERY TIME it is needed, not once at import.
+
+    A module-level constant is frozen at the moment the package is first
+    imported. In a notebook that is a trap: import etl once with the default,
+    set LOWROX_SOURCE_DSN afterwards, and the setup cell's own connection test
+    passes while the extractor keeps talking to the old database — which looks
+    like 18 inexplicable extraction failures rather than a configuration
+    mistake.
+    """
+    return os.environ.get("LOWROX_SOURCE_DSN", _DEFAULT_DSN)
+
+
+# Snapshot for display and for callers that only want to show it. Anything
+# that actually CONNECTS must call source_dsn().
+SOURCE_DSN = source_dsn()
 
 SOURCE_SYSTEM = "supabase_oltp"
 
@@ -112,11 +128,21 @@ class RunConfig:
     load_type: str = "init"            # 'init' | 'incremental'
     max_workers: int = 4               # parallel extraction (slide: Parallel Extraction)
     batch_rows: int = 5_000            # chunked load (slide: Parallel Loading)
+    connect_timeout: int = 30          # seconds; a hosted pooler is slower
+                                       # to answer than a local socket
     retry_attempts: int = 3            # slide: Retry Mechanism
     retry_base_delay: float = 0.25     # seconds, exponential backoff
     retry_max_delay: float = 4.0
     fail_fast: bool = False            # False -> bad rows go to the DLQ, run continues
     tables: tuple[str, ...] = field(default_factory=tuple)   # empty = all
+
+    def __post_init__(self):
+        # Against a hosted database every worker is a separate client
+        # connection through the pooler, and a free-tier pooler will start
+        # refusing or stalling them long before the gain is worth it. Local
+        # sockets have no such limit.
+        if "localhost" not in source_dsn() and "127.0.0.1" not in source_dsn():
+            self.max_workers = min(self.max_workers, 2)
 
     def selected(self) -> list[SourceTable]:
         if not self.tables:
