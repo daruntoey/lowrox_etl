@@ -134,6 +134,26 @@ for _p in (PROJECT_DIR, TESTS_DIR):
 assert os.path.isfile(os.path.join(TESTS_DIR, "test_functional.py")), \
     f"found etl/ at {PROJECT_DIR} but no tests/ beside it — the checkout is incomplete"
 
+
+def fresh_import(name):
+    """
+    Import a module, discarding anything cached from earlier in this kernel.
+
+    `import x` is a no-op once x is in sys.modules, so after pulling new code
+    the old version keeps running and the traceback points at a line that no
+    longer exists. importlib.reload() is not enough on its own either: if the
+    rewritten file has the same size and a same-second mtime the .pyc is still
+    considered valid and the stale bytecode is reused. Dropping the module,
+    clearing the bytecode and invalidating the finder caches is what actually
+    works — verified rather than assumed.
+    """
+    import importlib, shutil
+    for d in (TESTS_DIR, os.path.join(PROJECT_DIR, "etl")):
+        shutil.rmtree(os.path.join(d, "__pycache__"), ignore_errors=True)
+    sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+    return importlib.import_module(name)
+
 # ------------------------------------------------------------ connection
 # SUPABASE — paste your SESSION POOLER string (see the table above):
 #   postgresql://postgres.<ref>:<password>@aws-<n>-<region>.pooler.supabase.com:5432/postgres
@@ -441,12 +461,22 @@ the OLTP database, checking the measures survived every hop.
 code(r'''
 # TESTS_DIR was already put on sys.path by the setup cell.
 #
+# `import` is a no-op when the module is already in sys.modules, so after
+# pulling new code this would silently keep running the version loaded
+# earlier in the kernel — the symptom is a traceback from a line that no
+# longer exists. Reload explicitly rather than relying on a restart.
+F = fresh_import("test_functional")
+
+print(f"test_functional loaded from : {F.__file__}")
+print(f"etl package version         : {_etl.__version__}")
+assert hasattr(F, "require_gold") or "require_gold" in open(F.__file__).read(), (
+    "This is an OLD copy of test_functional.py — it has no preflight check. "
+    "Delete /content/lowrox_etl, re-run Part 0, and run the cells in order.")
+
 # If this cell raises "Gold table 'fct_workout_session' is empty", the message
 # names which of the four possible causes it is — the pipeline never ran, the
 # source is empty, the source is unreachable, or the quality gate rejected
-# everything — and what to do about each. The usual cause is simply running
-# this cell without having run Part 2 in the same session.
-import test_functional as F
+# everything — and what to do about each.
 
 walk = F.test_row_level_lineage_walk()
 ''')
@@ -521,7 +551,7 @@ Three things have to be true, and the third is the one most pipelines get wrong:
 """)
 
 code(r'''
-import test_incremental as I
+I = fresh_import("test_incremental")
 
 # This part WRITES to the source: it inserts workouts and payments, upgrades
 # two members, then deletes its own rows. Fine against seeded mock data, not
@@ -558,7 +588,7 @@ production rather than a stopwatch wrapped around the test.
 """)
 
 code(r'''
-import test_performance as P
+P = fresh_import("test_performance")
 
 thr = P.test_throughput_by_layer()
 lat = P.test_latency_breakdown()
@@ -665,7 +695,7 @@ for name, what in FAULT_CATALOGUE.items():
 ''')
 
 code(r'''
-import test_error_handling as E
+E = fresh_import("test_error_handling")
 sims = E.run_all(verbose=True)
 ''')
 
