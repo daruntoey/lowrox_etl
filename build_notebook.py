@@ -90,18 +90,43 @@ import glob, zipfile
 GITHUB_REPO = "https://github.com/daruntoey/lowrox_etl.git"   # None to skip cloning
 CLONE_INTO  = "/content/lowrox_etl"
 
-if IN_COLAB and GITHUB_REPO and not os.path.isdir(CLONE_INTO):
-    # subprocess takes a LIST, so the URL and the target cannot be glued into
+def _git(*args, cwd=None):
+    # subprocess takes a LIST, so a URL and a target path cannot be glued into
     # one argument. Written as a shell line (!git clone A B) a missing space
     # silently makes it one URL, and a failed !git clone does not raise in a
     # notebook, so the cell carries on as though the clone had worked.
-    r = subprocess.run(["git", "clone", "--depth", "1", GITHUB_REPO, CLONE_INTO],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stderr.strip())
-        print("\nClone failed. If the repo is private, Colab has no credentials for\n"
-              "it — either make it public, or upload lowrox_etl.zip with the folder\n"
-              "icon on the left and re-run this cell (the zip is picked up below).")
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+if IN_COLAB and GITHUB_REPO:
+    if os.path.isdir(os.path.join(CLONE_INTO, ".git")):
+        # IMPORTANT: "Restart session" restarts the Python kernel, it does NOT
+        # delete anything under /content. A checkout from an earlier run
+        # therefore survives every restart, and a plain "clone only if the
+        # folder is missing" check would skip it forever — which is exactly how
+        # a new notebook ends up running last week's code. Pull instead.
+        _git("fetch", "--depth", "1", "origin", cwd=CLONE_INTO)
+        before = _git("rev-parse", "HEAD", cwd=CLONE_INTO).stdout.strip()[:7]
+        r = _git("reset", "--hard", "origin/HEAD", cwd=CLONE_INTO)
+        if r.returncode != 0:                      # older git, no origin/HEAD
+            r = _git("reset", "--hard", "origin/main", cwd=CLONE_INTO)
+        after = _git("rev-parse", "HEAD", cwd=CLONE_INTO).stdout.strip()[:7]
+        if r.returncode != 0:
+            print("could not update the existing checkout:", r.stderr.strip()[:200])
+            print(f"delete it and re-run this cell:  !rm -rf {CLONE_INTO}")
+        elif before == after:
+            print(f"checkout already current ({after})")
+        else:
+            print(f"checkout updated {before} -> {after}")
+    else:
+        r = _git("clone", "--depth", "1", GITHUB_REPO, CLONE_INTO)
+        if r.returncode == 0:
+            print(f"cloned into {CLONE_INTO}")
+        else:
+            print(r.stderr.strip())
+            print("\nClone failed. If the repo is private, Colab has no credentials for\n"
+                  "it — either make it public, or upload lowrox_etl.zip with the folder\n"
+                  "icon on the left and re-run this cell (the zip is picked up below).")
 
 def find_project() -> str:
     """Locate the folder that actually contains etl/config.py."""
