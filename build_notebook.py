@@ -180,12 +180,21 @@ def fresh_import(name):
     return importlib.import_module(name)
 
 # ------------------------------------------------------------ connection
-# SUPABASE — paste your SESSION POOLER string (see the table above):
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  PASTE YOUR CONNECTION STRING BETWEEN THE QUOTES ON THE NEXT LINE.   ║
+# ║  Nowhere else in this cell. Edit nothing below it.                   ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+PASTE_CONNECTION_STRING_HERE = ""
+
+# Supabase -> your project -> Connect -> Connection string -> Session pooler.
+# It looks like:
 #   postgresql://postgres.<ref>:<password>@aws-<n>-<region>.pooler.supabase.com:5432/postgres
 #
-# Better: put it in Colab's secrets panel (the key icon) as SUPABASE_DSN, so the
-# password never appears in the notebook you hand in.
-DSN = os.environ.get("LOWROX_SOURCE_DSN")
+# Leave it empty to use Colab's secrets panel instead (the key icon, name it
+# SUPABASE_DSN) — then the password never appears in the notebook you hand in,
+# which matters because this file goes to your marker and to a public repo.
+
+DSN = PASTE_CONNECTION_STRING_HERE.strip() or os.environ.get("LOWROX_SOURCE_DSN")
 if not DSN and IN_COLAB:
     try:
         from google.colab import userdata
@@ -195,6 +204,20 @@ if not DSN and IN_COLAB:
 if not DSN:
     DSN = "postgresql://lowrox:lowrox@localhost:5432/lowrox"   # local test database
 os.environ["LOWROX_SOURCE_DSN"] = DSN
+
+# A connection string handed to os.environ.get() asks for an environment
+# VARIABLE NAMED that string, which never exists — so it returns None and the
+# localhost fallback takes over, producing a "connection refused on localhost"
+# error that says nothing about the real mistake. Catch it by name instead.
+for _name in list(os.environ):
+    if _name.startswith(("postgres://", "postgresql://")):
+        raise RuntimeError(
+            "A connection string is being used as an environment variable NAME.\n"
+            "Somewhere there is  os.environ.get(\"postgresql://...\")  or\n"
+            "os.environ[\"postgresql://...\"].  os.environ.get(X) looks up a\n"
+            "variable called X; it does not set anything.\n\n"
+            "Put the string in PASTE_CONNECTION_STRING_HERE at the top of this\n"
+            "connection block instead, and leave the lines below it alone.")
 
 # Colab has no /home/claude, and its disk is wiped on disconnect. Either run
 # this notebook top to bottom in one session — it does init AND incremental in
