@@ -683,25 +683,29 @@ net = P.test_parallelism_under_network_latency()
 ''')
 
 md(r"""
-Read the second table as a controlled comparison rather than as a headline
-number: the same data, the same worker counts, measured with and without an
-injected round trip. On localhost extra workers make things slightly *worse* —
-there is no network wait to hide, so the threads only contend. Once the source
-is 200 ms away the same workers come out ahead. That figure is not arbitrary:
-a Colab runtime reaching a free-tier pooler in another region — `ap-south-1`,
-Mumbai, in this project's case — pays roughly that per connection, and the
-pipeline opens one per table.
+The second table is a controlled comparison — the same data, the same worker
+counts, measured with and without an injected 200 ms round trip. That figure is
+not arbitrary: a Colab runtime reaching a free-tier pooler in another region
+pays roughly that per connection, and the pipeline opens one per table.
 
-The gap between those two conditions is the finding, not either number on its
-own, and the absolute effect here is modest because at 2,000 rows per table the
-time spent transferring rows outweighs the one connection each table pays for.
-With more tables, or fewer rows in each, the fixed per-connection cost
-dominates and the gap widens.
+**It is reported, not asserted on, and the report should say so.** Repeated runs
+of this same comparison on one machine came out at 0.85× vs 1.49×, then 0.94×
+vs 1.01×, then 2.33× vs 1.69×, then 0.83× vs 1.46×. It swings in both
+directions, because what is being timed — a few seconds of thread scheduling
+against a database on the same box — is the same order of magnitude as the
+background noise on a shared host. Gating a test suite on a number that
+unstable measures the machine's mood, not the pipeline.
 
-What this settles is that `max_workers` is a configuration value whose right
-setting depends on where the source lives — Supabase in Singapore is a network
-hop away from wherever this notebook runs, and localhost is not. It is a config
-field for that reason, not a constant.
+The mechanism underneath is still real: parallelism exists to hide a round
+trip, and there is no round trip to hide on the same machine. What that settles
+is a design question rather than a performance claim — `max_workers` belongs in
+configuration, because the right setting depends on where the source lives. To
+measure it properly you would need repeated trials on a quiet machine and a
+median, which is a different exercise from proving the pipeline correct.
+
+This is also why `RunConfig` caps `max_workers` at 2 when the source is not
+local: a free-tier pooler has a small connection allowance, and spending it to
+chase a speedup this uncertain is a poor trade.
 """)
 
 code(r'''
