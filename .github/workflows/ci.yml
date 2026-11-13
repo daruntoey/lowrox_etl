@@ -1,0 +1,112 @@
+# Stage 2 of slide 12 — pipeline continuous integration.
+#
+# Slide 4: in ML, CI validates code, DATA, DATA SCHEMAS and MODELS, not just
+# code. The four jobs below are that list. A normal software CI would stop
+# after the first.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  code:
+    name: Code — unit and contract tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: lowrox
+          POSTGRES_USER: lowrox
+          POSTGRES_DB: lowrox
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-ml.txt
+      - name: Seed the test database
+        env: { PGPASSWORD: lowrox }
+        run: |
+          psql -h localhost -U lowrox -d lowrox -f sql/01_schema.sql
+          psql -h localhost -U lowrox -d lowrox -f sql/02_seed.sql
+      - name: ETL test suites
+        env:
+          LOWROX_SOURCE_DSN: postgresql://lowrox:lowrox@localhost:5432/lowrox
+          LOWROX_LAKE_ROOT: ${{ runner.temp }}/lake
+          LOWROX_ALLOW_SOURCE_WRITES: '1'
+        run: |
+          python -c "from etl import run_pipeline, reset_lake; reset_lake(); \
+                     r=run_pipeline('init', echo=False); \
+                     assert r.ok, 'init load failed'"
+          python tests/test_functional.py
+          python tests/test_incremental.py
+          python tests/test_error_handling.py
+
+  data-and-model:
+    name: Data, schema and model validation
+    needs: code
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: lowrox
+          POSTGRES_USER: lowrox
+          POSTGRES_DB: lowrox
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-ml.txt
+      - name: Seed
+        env: { PGPASSWORD: lowrox }
+        run: |
+          psql -h localhost -U lowrox -d lowrox -f sql/01_schema.sql
+          psql -h localhost -U lowrox -d lowrox -f sql/02_seed.sql
+      - name: Validate data, schema and model
+        env:
+          LOWROX_SOURCE_DSN: postgresql://lowrox:lowrox@localhost:5432/lowrox
+          LOWROX_LAKE_ROOT: ${{ runner.temp }}/lake
+        run: python -m mlops.pipeline_ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-report
+          path: ${{ runner.temp }}/ci_report.csv
+
+  package:
+    name: Package the pipeline
+    needs: data-and-model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      # Slide 12 stage 2: "the outputs of this stage are pipeline components
+      # (packages, executables, artifacts) to be deployed in a later stage."
+      # The artefact is the PIPELINE, not a model.
+      - run: |
+          pip install build
+          python -m build --wheel --outdir dist/ || tar -czf dist.tar.gz etl mlops sql
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-package
+          path: |
+            dist/
+            dist.tar.gz
+          if-no-files-found: ignore

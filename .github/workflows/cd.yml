@@ -1,0 +1,69 @@
+# Stages 3, 4 and 5 of slide 12 — pipeline CD, automated triggering,
+# continuous training, and model CD.
+#
+# The schedule is the "Trigger" box in the level 1 and 2 diagrams. The
+# promotion step is what stops continuous training from becoming continuous
+# degradation: a retrained model is not automatically a better model.
+name: CD — continuous training and deployment
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '41 19 * * 1'      # weekly, off the hour and outside peak
+  workflow_dispatch:
+    inputs:
+      force_promote:
+        description: Promote even if it does not beat production
+        type: boolean
+        default: false
+
+concurrency:
+  group: lowrox-cd
+  cancel-in-progress: false      # never interrupt a training run mid-flight
+
+jobs:
+  continuous-training:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-ml.txt
+
+      - name: Stage 3 — deploy the pipeline
+        run: python -m mlops.pipeline_cd --stage deploy-pipeline
+
+      - name: Stage 4 — evaluate triggers and train
+        env:
+          LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
+          LOWROX_LAKE_ROOT: ${{ runner.temp }}/lake
+        run: python -m mlops.pipeline_cd --stage train
+
+      - name: Stage 5 — promote only if it beats production
+        env:
+          LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
+        run: |
+          python -m mlops.pipeline_cd --stage promote \
+            ${{ inputs.force_promote && '--force' || '' }}
+
+      - name: Stage 6 — monitor and publish the dashboard
+        env:
+          LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
+        run: python -m mlops.pipeline_cd --stage monitor
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: model-and-dashboard
+          path: |
+            model_registry/
+            lowrox_dashboard.html

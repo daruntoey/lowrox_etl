@@ -7,7 +7,22 @@ Run `lowrox_etl_demo.ipynb` — it already has every output embedded, so it can 
 read without running anything.
 
 ```
-etl/                 the pipeline
+mlops/               MLOps and the feature store (Chapter 7)
+  feature_store.py   feature sets, offline/online stores, point-in-time joins
+  features.py        the Lowrox feature definitions and the churn label
+  training.py        the 8 data science steps, validation gates, calibration
+  registry.py        model versions, metrics, gated promotion
+  serving.py         batch + online scoring, training/serving skew test
+  monitoring.py      data / label / concept drift, edge cases, missingness
+  orchestrator.py    the 6 MLOps level-2 stages + ML metadata store
+  ci.py              CI on code, data, schemas and models
+  simulate.py        deliberate drift, so the monitors can be seen firing
+  dashboard.py       self-contained HTML dashboard
+  demo_data.py       enough data to train on, with no database
+.github/workflows/   ci.yml and cd.yml — MLOps level 2
+lowrox_mlops_demo.ipynb  the MLOps notebook, executed
+
+etl/                 the ETL pipeline
   config.py          where things live, the 18-table registry
   lineage.py         row-level stamps + the run-level edge registry
   metrics.py         timing and throughput, measured not estimated
@@ -301,3 +316,110 @@ classified as non-retryable and aborts the whole extraction phase on the first
 occurrence, so one bad password costs about five connection attempts instead of
 fifty-four. That change is in `etl/errors.py` (`classify_connection_error`) and
 `etl/extract.py`.
+
+
+---
+
+# Part 2 — MLOps and the feature store
+
+`lowrox_mlops_demo.ipynb` covers Chapter 7: **Staging → Feature Store → Model →
+Registry → Serving → Monitoring → Dashboard**, with CI/CD around all of it.
+
+It runs on Colab with **no database**. If the lakehouse holds enough members it
+is used; otherwise the same calibrated generator writes a larger synthetic set
+straight into Silver. The Supabase project has 50 members — enough to prove a
+pipeline, far too few for a model.
+
+## The feature store
+
+Slide 23's shape — **index + time index + features** — with four feature sets
+and 42 features, materialised to two stores from one computation:
+
+| store | contents | used by |
+| --- | --- | --- |
+| offline | full history, every monthly snapshot | building training sets |
+| online | latest row per member | serving predictions |
+
+Training sets are built with `merge_asof(direction="backward")`, so each label
+row sees only feature values that existed at or before its own timestamp. An
+ordinary join would attach today's values to a six-month-old label, and the
+model would score beautifully offline and collapse in production.
+
+Both properties are tested, not asserted: `assert_no_future_leakage` walks
+sampled rows back through the offline history, and
+`check_training_serving_skew` compares the two retrieval paths feature by
+feature.
+
+## Three leaking features, and the rule behind them
+
+This is the most useful thing in the project. Three times a model scored
+**ROC-AUC near 0.995** and was worthless:
+
+| column | why it leaked |
+| --- | --- |
+| `txn_user_subscriptions.auto_renew` | cleared at cancellation — matches the label 490/490 |
+| `ms_users.tier` | downgraded to `free` at cancellation — 490/490 |
+| `txn_user_subscriptions.status` | `cancelled` **is** the label |
+
+The point-in-time join was correct every time. The leak was in the feature
+**definition**: Silver holds the *current* value of a mutable column, not its
+history, so reading one at a past snapshot returns a value from the future.
+
+> **A column can only be a point-in-time feature if its history exists.**
+
+The defence is a validation gate willing to reject a model for being too good:
+`roc_auc < 0.98` and no single feature above 50% of the importance. Both now
+run on every training job.
+
+## Monitoring, with every check fired on purpose
+
+Six checks, one per failure mode in slides 13–19, each demonstrated:
+
+| scenario | which check fires |
+| --- | --- |
+| healthy | nothing — the hard part |
+| distribution shift | data distribution shift |
+| same mean, wider spread | data distribution shift + edge cases |
+| label drift | label drift |
+| concept drift | **concept drift alerts while data shift stays `ok`** |
+| edge cases | edge cases |
+| a feed goes quiet | missing-as-a-feature |
+
+The concept-drift row is slide 16's distinction being *detected*: p(y|X) moved
+while p(X) stood still.
+
+Getting the healthy row quiet took three corrections, all ordinary mistakes:
+
+1. **Features that trend by construction.** Tenure and lifetime counters grow
+   every month, so comparing their level to a training window that ended months
+   ago alerts for ever. Now reported as `expected_trend`; their *shape* is still
+   checked.
+2. **A threshold equal to the rate that occurs by definition.** The p01–p99 band
+   excludes 2% of training data, so a 2% edge-case threshold warns on data drawn
+   from the training distribution itself.
+3. **A baseline from a different population.** Using the test-period ROC-AUC as
+   the concept-drift reference against a training-period holdout reported a
+   0.115 drop on untouched data — the training months run at 13–14% churn and
+   the test months at 7–8%.
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs four suites, because slide 4 says ML CI
+validates **data, schemas and models**, not just code — 25 checks. `cd.yml`
+runs the six stages of slide 12 weekly: deploy pipeline, train, promote,
+monitor, publish.
+
+Promotion is gated on beating the incumbent. Automatic retraining without that
+comparison is automatic degradation waiting for a bad week of data.
+
+## Honest limitations
+
+- **Synthetic data.** The pipeline is proved; the relationships were placed in
+  `calibration.py`.
+- **Monitoring has never seen production traffic.** The detectors are proved to
+  fire; the thresholds are not proved right for real behaviour.
+- **ROC-AUC 0.75–0.79, about 2.2× lift at the top 20%.** A usable retention
+  list and nothing more. The three excellent versions that preceded it were all
+  leakage.
+- **One label definition.** Churn is "cancelled within 60 days of the snapshot";
+  a different horizon is a different problem.
