@@ -32,7 +32,7 @@ import hashlib
 import numpy as np
 import pandas as pd
 
-from .feature_store import FeatureSet, REGISTRY
+from .feature_store import FeatureSet, REGISTRY, STORE_TIME_UNIT, to_store_time
 
 # --------------------------------------------------------------------------
 # The snapshot grid
@@ -42,8 +42,21 @@ CHURN_HORIZON_DAYS = 60       # cancelled within this many days of the snapshot
 
 
 def snapshot_dates(start, end, freq: str = SNAPSHOT_FREQ) -> pd.DatetimeIndex:
-    return pd.date_range(pd.Timestamp(start).normalize(),
-                         pd.Timestamp(end).normalize(), freq=freq, tz="UTC")
+    """
+    The time index every feature set and the label table are built on.
+
+    Pinned to the feature store's resolution (see feature_store.STORE_TIME_UNIT):
+    on pandas 2.x `date_range` returns nanoseconds while the store returns
+    microseconds, and merge_asof will not join across the two. Fixing it here
+    means the panel and the store agree from the start, rather than being
+    reconciled at each join.
+    """
+    idx = pd.date_range(pd.Timestamp(start).normalize(),
+                        pd.Timestamp(end).normalize(), freq=freq, tz="UTC")
+    try:
+        return idx.as_unit(STORE_TIME_UNIT)
+    except AttributeError:
+        return idx
 
 
 def _grid(users: pd.Series, snapshots: pd.DatetimeIndex) -> pd.DataFrame:
@@ -421,4 +434,7 @@ def build_labels(src: dict, horizon_days: int = CHURN_HORIZON_DAYS) -> pd.DataFr
         }))
 
     labels = pd.concat(rows, ignore_index=True)
+    # The caller may pass its own snapshot dates, so pin the resolution here
+    # too rather than inheriting whatever they were built at.
+    labels["ts"] = to_store_time(labels["ts"])
     return labels.drop_duplicates(subset=["user_id", "ts"], keep="last")

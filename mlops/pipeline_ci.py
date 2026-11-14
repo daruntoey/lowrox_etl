@@ -15,8 +15,37 @@ from . import (ci, config, feature_store, features, monitoring, registry,
 from .sources import load_sources
 
 
+REQUIRED_SILVER = ("ms_users", "txn_workout_summaries", "txn_user_subscriptions")
+
+
+def _require_lake() -> None:
+    """
+    Say plainly that the lake is not there, before pandas says it with a
+    KeyError thirty frames deep.
+
+    A CI runner has no one watching it, so the first thing it reports has to
+    be the actual cause. Without this, a lake at the wrong path surfaces as
+    `KeyError: None of ['id', 'tier', 'created_at'] are in the [columns]`
+    from inside a feature definition, which reads like a schema bug in code
+    that is fine.
+    """
+    missing = [t for t in REQUIRED_SILVER
+               if not (config.LAKE_ROOT / "silver" / t / "_delta_log").exists()]
+    if not missing:
+        return
+    raise SystemExit(
+        f"\nNo Silver data at {config.LAKE_ROOT}/silver\n"
+        f"  missing: {', '.join(missing)}\n\n"
+        f"The feature store is built from Silver, so there is nothing to\n"
+        f"materialise. Either point LOWROX_LAKE_ROOT at a lake that has been\n"
+        f"loaded, or populate one first:\n\n"
+        f"  python3 -c \"from mlops import demo_data; "
+        f"demo_data.ensure_training_data('{config.LAKE_ROOT}')\"\n")
+
+
 def main() -> int:
     config.wire()
+    _require_lake()
     snaps = features.snapshot_dates(config.SNAPSHOT_START, config.SNAPSHOT_END)
     src = load_sources(config.LAKE_ROOT, snaps)
     for fs in features.ALL_FEATURE_SETS:

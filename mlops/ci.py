@@ -103,6 +103,21 @@ def test_schema(training: pd.DataFrame, feature_sets: list) -> bool:
                    and not pd.api.types.is_numeric_dtype(training[f])]
     ok &= _check("schema", "every feature is numeric at the model boundary",
                  not numeric_bad, f"{numeric_bad}")
+
+    # The time index must sit at the store's resolution on BOTH sides of the
+    # point-in-time join. When it does not, merge_asof raises MergeError and
+    # no training set can be built at all — a schema fault, caught here with
+    # a name on it rather than as a traceback six cells later.
+    from .feature_store import STORE_TIME_UNIT, read_offline
+    want = f"datetime64[{STORE_TIME_UNIT}, UTC]"
+    units = {"training.ts": str(training["ts"].dtype)} if "ts" in training else {}
+    for fs in feature_sets:
+        hist = read_offline(fs)
+        if not hist.empty and fs.timestamp in hist.columns:
+            units[f"{fs.name}.{fs.timestamp}"] = str(hist[fs.timestamp].dtype)
+    wrong = {k: v for k, v in units.items() if v != want}
+    ok &= _check("schema", f"time index is {want} everywhere", not wrong,
+                 f"{wrong}" if wrong else f"{len(units)} checked")
     return ok
 
 

@@ -419,14 +419,23 @@ schedule.
 """)
 
 code(r'''
-import pathlib
-for wf in sorted(pathlib.Path(PROJECT_DIR, ".github/workflows").glob("*.yml")):
+import pathlib, re
+try:
     import yaml
-    d = yaml.safe_load(wf.read_text())
+except ImportError:                     # not on this runtime — read the jobs directly
+    yaml = None
+for wf in sorted(pathlib.Path(PROJECT_DIR, ".github/workflows").glob("*.yml")):
     print(f"{wf.name}")
-    for job, spec in d["jobs"].items():
-        steps = len(spec.get("steps", []))
-        print(f"   job '{job}'  {steps} steps  needs={spec.get('needs','-')}")
+    text = wf.read_text()
+    if yaml is not None:
+        d = yaml.safe_load(text)
+        for job, spec in d["jobs"].items():
+            steps = len(spec.get("steps", []))
+            print(f"   job '{job}'  {steps} steps  needs={spec.get('needs','-')}")
+    else:
+        body = text.split("\njobs:", 1)[-1]
+        for job in re.findall(r"^  ([a-z0-9][\w-]*):", body, re.M):
+            print(f"   job '{job}'")
 ''')
 
 # --------------------------------------------------------------------------

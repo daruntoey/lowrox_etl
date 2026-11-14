@@ -405,12 +405,45 @@ Getting the healthy row quiet took three corrections, all ordinary mistakes:
 ## CI/CD
 
 `.github/workflows/ci.yml` runs four suites, because slide 4 says ML CI
-validates **data, schemas and models**, not just code — 25 checks. `cd.yml`
+validates **data, schemas and models**, not just code — 26 checks. `cd.yml`
 runs the six stages of slide 12 weekly: deploy pipeline, train, promote,
 monitor, publish.
 
 Promotion is gated on beating the incumbent. Automatic retraining without that
 comparison is automatic degradation waiting for a bad week of data.
+
+## A library version is part of the pipeline
+
+The first run on Colab failed at the point-in-time join with
+
+```
+MergeError: incompatible merge keys [1] datetime64[ns, UTC] and
+            datetime64[us, UTC], must be the same type
+```
+
+Nothing was wrong with the join. A pandas datetime column carries a
+*resolution*, `merge_asof` refuses to join two keys that disagree on it, and
+the two sides of this join come from different places: labels are built in
+pandas, features are read back out of Delta. On pandas 2.x `date_range`
+returns nanoseconds while Arrow always writes microseconds, so the two halves
+disagreed by default.
+
+Worth stating in the report, because it is the more interesting half: **the
+code was developed on pandas 3, where `date_range` already returns
+microseconds, so the fault could not occur — and it failed on the first cell
+that ran on Colab's pandas 2.** The pipeline was never correct; it was
+accidentally compatible with one environment. `requirements.txt` said
+`pandas>=2.0`, which permitted both.
+
+The fix pins the resolution rather than the library, since Colab brings its own
+pandas: `feature_store.STORE_TIME_UNIT = "us"` — microseconds, because that is
+what survives the Delta round trip, so normalising to nanoseconds would be
+undone by the next write and the mismatch would return on the next read.
+`to_store_time()` applies it on both sides of every join, `snapshot_dates()`
+builds the panel at the same resolution, and a CI schema check now asserts it
+across the training table and all four offline stores, so it cannot regress
+quietly. Verified by running the full notebook on both pandas 2.2.3 and 3.0.5:
+45 cells, 0 errors, and the same 7,931 × 44 training table from each.
 
 ## Honest limitations
 
@@ -423,3 +456,6 @@ comparison is automatic degradation waiting for a bad week of data.
   leakage.
 - **One label definition.** Churn is "cancelled within 60 days of the snapshot";
   a different horizon is a different problem.
+- **Two pandas versions tested, not all of them.** 2.2.3 and 3.0.5 both pass.
+  The resolution is pinned explicitly, so a third should behave, but "should"
+  is the honest word.

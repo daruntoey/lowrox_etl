@@ -41,6 +41,40 @@ from deltalake import DeltaTable, write_deltalake
 # --------------------------------------------------------------------------
 FEATURE_STORE_ROOT = Path("/content/feature_store")   # overridden by config
 
+# One resolution for every timestamp in the store.
+#
+# This is not housekeeping — it decides whether the point-in-time join runs at
+# all. pandas stores a datetime column at a resolution (ns, us, ms, s), and
+# merge_asof refuses to join two keys that disagree, with
+#
+#     MergeError: incompatible merge keys, must be the same type
+#
+# while an ordinary merge quietly casts. The two sides disagree by default:
+# labels are built in pandas, and on pandas 2.x `date_range` yields
+# nanoseconds, while anything read back out of Delta arrives as microseconds,
+# because that is what Arrow writes. Nothing in the pipeline is wrong when this
+# fires; the two halves simply came from different places.
+#
+# Microseconds, not nanoseconds, because that is what survives the Delta round
+# trip unchanged. Normalising to ns would be undone by the next write, and the
+# mismatch would come back on the next read.
+#
+# Worth noting for the report: this never appeared while the code was developed
+# on pandas 3, where `date_range` already returns microseconds, and it failed
+# immediately on Colab's pandas 2. A library-version difference is enough to
+# turn a working pipeline into a broken one, which is the argument for pinning
+# versions (requirements-ml.txt) rather than trusting the environment.
+STORE_TIME_UNIT = "us"
+
+
+def to_store_time(values, unit: str = STORE_TIME_UNIT) -> pd.Series:
+    """Parse to UTC and force one resolution, so joins cannot fail on dtype."""
+    s = pd.to_datetime(values, utc=True)
+    try:
+        return s.dt.as_unit(unit)          # pandas >= 2.0
+    except AttributeError:                 # pandas 1.x: ns is the only option
+        return s
+
 
 def set_root(path: str | Path) -> Path:
     global FEATURE_STORE_ROOT
@@ -164,7 +198,7 @@ def materialise(fs: FeatureSet, sources: dict, *, run_id: str = "") -> dict:
         raise ValueError(f"{fs.name}: compute() did not return {missing}")
 
     df = df[fs.columns()].copy()
-    df[fs.timestamp] = pd.to_datetime(df[fs.timestamp], utc=True)
+    df[fs.timestamp] = to_store_time(df[fs.timestamp])
     df = df.sort_values([fs.entity, fs.timestamp]).reset_index(drop=True)
     df["_materialised_at"] = datetime.now(timezone.utc)
     df["_run_id"] = run_id
@@ -223,7 +257,7 @@ def get_training_data(labels: pd.DataFrame, feature_sets: list[FeatureSet], *,
     most common way a feature store earns its keep.
     """
     out = labels.copy()
-    out[timestamp] = pd.to_datetime(out[timestamp], utc=True)
+    out[timestamp] = to_store_time(out[timestamp])
     out = out.sort_values(timestamp).reset_index(drop=True)
     report = []
 
@@ -232,7 +266,7 @@ def get_training_data(labels: pd.DataFrame, feature_sets: list[FeatureSet], *,
         if right.empty:
             raise ValueError(f"{fs.name} has not been materialised")
         right = right[fs.columns()].copy()
-        right[fs.timestamp] = pd.to_datetime(right[fs.timestamp], utc=True)
+        right[fs.timestamp] = to_store_time(right[fs.timestamp])
         right = right.sort_values(fs.timestamp).reset_index(drop=True)
 
         before = len(out)
@@ -291,7 +325,7 @@ def assert_no_future_leakage(training: pd.DataFrame, feature_sets: list[FeatureS
         hist = read_offline(fs)
         if hist.empty:
             continue
-        hist[fs.timestamp] = pd.to_datetime(hist[fs.timestamp], utc=True)
+        hist[fs.timestamp] = to_store_time(hist[fs.timestamp])
         for _, row in sample.iterrows():
             rows = hist[(hist[fs.entity] == row[entity])
                         & (hist[fs.timestamp] <= row[timestamp])]

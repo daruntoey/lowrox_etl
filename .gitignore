@@ -16,3 +16,12 @@ lake/
 **/bronze/
 **/silver/
 **/gold/
+
+# Model and feature-store output. Same reasoning as the lake: artefacts are
+# rebuilt by `python3 -m mlops.pipeline_ci`, and a .pkl in git is a binary
+# nobody can review.
+mlops_store/
+*_store/
+feature_store/
+out/
+predictions/
