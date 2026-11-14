@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from etl import FaultInjector, reset_lake, run_pipeline
 from etl.config import GOLD, SILVER, TABLES_BY_NAME
 from etl.errors import DeadLetterQueue
+from etl.preflight import connect
 from deltalake import DeltaTable
 
 RESULTS: list[dict] = []
@@ -35,6 +36,28 @@ BANNER = "-" * 74
 def record(sim: str, expected: str, observed: str, passed: bool):
     RESULTS.append({"simulation": sim, "expected": expected,
                     "observed": observed, "result": "PASS" if passed else "FAIL"})
+
+
+_SRC_COUNTS: dict[str, int] = {}
+
+
+def _source_rows(table: str) -> int:
+    """
+    How many rows the SOURCE holds for one table, asked once and cached.
+
+    The simulations used to assert `== 50`, the row count of the 50-row
+    development dataset. That coupled the error-handling suite to one dataset
+    size: run the same pipeline against the 2,000-row seed and three
+    simulations failed, not because error handling broke but because the
+    number in the assertion was a different dataset's. What the simulation
+    actually claims is "the OTHER tables still loaded completely", so the
+    expectation belongs to the source, not to the test file.
+    """
+    if table not in _SRC_COUNTS:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {table}")
+            _SRC_COUNTS[table] = int(cur.fetchone()[0])
+    return _SRC_COUNTS[table]
 
 
 def _delta_rows(path) -> int:
@@ -65,12 +88,13 @@ def sim_1_transient_source_failure(verbose: bool = True):
     users = _delta_rows(TABLES_BY_NAME["ms_users"].bronze_path)
     attempts = next((s.attempts for s in r.metrics.steps
                      if s.layer == "extract" and s.step == "ms_users"), 0)
-    ok = r.ok and users == 50 and attempts == 3
+    expected = _source_rows("ms_users")
+    ok = r.ok and users == expected and attempts == 3
     if verbose:
         print(f"\n  retry attempts used : {attempts} of 3")
-        print(f"  ms_users in bronze  : {users}")
+        print(f"  ms_users in bronze  : {users} of {expected} in the source")
         print(f"  run status          : {'SUCCESS' if r.ok else 'FAILED'}")
-    record("1. Transient source failure", "retry recovers, 50 rows load",
+    record("1. Transient source failure", f"retry recovers, {expected} rows load",
            f"recovered on attempt {attempts}, {users} rows, run {'ok' if r.ok else 'failed'}", ok)
     assert ok
     return r
@@ -95,7 +119,9 @@ def sim_2_permanent_source_failure_is_isolated(verbose: bool = True):
     payments_rows = _delta_rows(TABLES_BY_NAME["txn_payments"].bronze_path)
     workouts_rows = _delta_rows(TABLES_BY_NAME["txn_workout_summaries"].bronze_path)
     critical = [a for a in r.alerts.alerts if a.severity == "critical"]
-    ok = payments_rows == 0 and workouts_rows == 50 and len(loaded) >= 16 and critical
+    ok = (payments_rows == 0
+          and workouts_rows == _source_rows("txn_workout_summaries")
+          and len(loaded) >= 16 and critical)
     if verbose:
         print(f"\n  tables that still loaded : {len(loaded)} of 18")
         print(f"  txn_payments in bronze   : {payments_rows} (expected 0)")
@@ -164,7 +190,8 @@ def sim_4_schema_drift_is_detected(verbose: bool = True):
     drift_detected = step is not None and "SchemaDrift" in (step.error or "")
     not_retried = step is not None and step.attempts == 1
 
-    ok = drift_detected and not_retried and bronze_rows == 0 and others == 50 and critical
+    ok = (drift_detected and not_retried and bronze_rows == 0
+          and others == _source_rows("txn_payments") and critical)
     if verbose:
         print(f"\n  fault detected as      : {step.error.split(':')[0] if step else 'n/a'}")
         print(f"  retry attempts used    : {step.attempts if step else 0} "

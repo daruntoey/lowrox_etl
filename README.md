@@ -43,6 +43,28 @@ build_notebook.py          regenerates the notebook
 
 ---
 
+## The three notebooks
+
+| notebook | covers | needs |
+| --- | --- | --- |
+| **`lowrox_full_demo.ipynb`** | the whole chain, source database to dashboard — Stage A is the ETL, Stage B is MLOps | nothing; it builds its own PostgreSQL source |
+| `lowrox_etl_demo.ipynb` | Stage A on its own, against Supabase | a connection string |
+| `lowrox_mlops_demo.ipynb` | Stage B on its own | nothing |
+
+`lowrox_full_demo.ipynb` is the one to run and the one to hand in. `SOURCE =
+"local"` in its setup cell installs PostgreSQL where the notebook is running
+and seeds it from `generate.py` at 50, 500 and 2,000 rows per table (about 20
+seconds, `local_source.py`), so there is no password in the notebook and the
+model trains on 2,000 members instead of 50. `SOURCE = "supabase"` extracts
+from the real project instead.
+
+That combination closed a seam worth describing in the report. While the two
+notebooks were separate, the model could not learn from the ETL's output: the
+Supabase project holds 50 members, which is about nine churn events in a test
+split, so Stage B generated a larger set and wrote it straight into Silver.
+Everything worked and the model had never seen the pipeline's own output. The
+fix was not a better model — it was a bigger source.
+
 ## Where to run it
 
 | | Verdict |
@@ -277,6 +299,28 @@ Worth putting in the report, because finding them is what the testing was for.
    measure was empty. Extraction now compares the source contract against what
    the query returned and refuses the table.
 
+## The tests were coupled to one dataset size
+
+Pointing the suites at the 2,000-row seed instead of the 50-row one failed four
+assertions, and none of the failures were about the pipeline:
+
+- `test_functional.py` compared Gold's total distance against the source minus
+  the ids `[7, 19, 31, 42, 48]` — the five rows that fail the DQ rules in the
+  50-row dataset. At 2,000 rows, 176 different rows are quarantined.
+- three simulations in `test_error_handling.py` asserted `rows == 50`, which is
+  the development dataset's row count rather than anything the simulation
+  claims.
+
+Both now derive the expectation instead of stating it. The quarantined ids are
+read back out of the pipeline's own dead-letter queue, which is also a stronger
+claim than the original — Gold equals the source minus exactly the rows the
+pipeline **says** it dropped, rather than minus a list someone typed. The
+simulations ask the source for its row count. All four suites now pass at 50,
+500 and 2,000 rows per table.
+
+Worth saying plainly: the suites had passed every run for weeks. They were
+tested against one dataset, so they were correct about one dataset.
+
 ## One limitation to state before anyone asks
 
 A high-watermark incremental load cannot see a row whose timestamp lands *behind*
@@ -388,7 +432,7 @@ Six checks, one per failure mode in slides 13–19, each demonstrated:
 The concept-drift row is slide 16's distinction being *detected*: p(y|X) moved
 while p(X) stood still.
 
-Getting the healthy row quiet took three corrections, all ordinary mistakes:
+Getting the healthy row quiet took five corrections, all ordinary mistakes:
 
 1. **Features that trend by construction.** Tenure and lifetime counters grow
    every month, so comparing their level to a training window that ended months
@@ -401,6 +445,34 @@ Getting the healthy row quiet took three corrections, all ordinary mistakes:
    the concept-drift reference against a training-period holdout reported a
    0.115 drop on untouched data — the training months run at 13–14% churn and
    the test months at 7–8%.
+4. **A single moment standing in for a distribution.**
+   `consistency_x_volume` warned on every healthy run with a std ratio of 0.62
+   beside a PSI of 0.0000 and a KS p-value of 1.00. It is a product of two
+   features, so its standard deviation is dominated by the tail, and a
+   subsample that misses the tail moves it 38% while the distribution is
+   identical. A spread signal is now believed only when PSI and KS do not
+   contradict it — which also sharpened four other rows: `label_drift` and
+   `concept_drift` now report `ok` for data shift, correctly, because neither
+   touches X.
+5. **A distance measured against the wrong reference, at a threshold borrowed
+   from the wrong distribution.** The multivariate check took its centre and
+   covariance from the *live batch itself*, so it never compared live to
+   training at all, and its cutoff was a chi-squared quantile — which assumes a
+   normality that zero-inflated counts and heavy-tailed products do not have.
+   At chi2(0.999) the **training data itself** came out 3.7% multivariate
+   outliers against a 5% threshold. It now uses the training centre and
+   covariance with the training set's own 99th percentile of distance, so the
+   expected rate is 1% by construction.
+
+   Fixing that exposed what the check had been hiding: **it could not detect
+   the scenario it was paired with.** Injecting 5% of rows at (volume p99,
+   consistency p01) — slide 17's exact example — moved the 12-feature rate
+   from 0.79% to 0.79%, while the same rows moved the *pairwise* rate for those
+   two features from 1.18% to 5.99%. A contradiction between two features is a
+   small displacement in twelve dimensions and a large one in the plane where
+   it happens, so the check now looks at the three most correlated pairs as
+   well as the whole space. A monitor that cannot see its own test case is
+   worse than no monitor, because it reports `ok`.
 
 ## CI/CD
 

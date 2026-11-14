@@ -556,8 +556,8 @@ reports `ok` while concept drift alerts.** That is slide 16's distinction being
 detected rather than asserted — p(y|X) moved while p(X) stood still. The two
 have different responses, so telling them apart matters.
 
-Getting the healthy row quiet required two corrections, both of which are
-ordinary mistakes:
+Getting the healthy row quiet took five corrections, none of them exotic —
+every one was a monitor measuring something other than what it claimed to:
 
 - **Features that trend by construction.** Tenure is larger every month;
   lifetime counters only ever increase. Comparing their *level* against a
@@ -566,6 +566,35 @@ ordinary mistakes:
 - **A threshold set at exactly the rate that occurs by definition.** The
   p01–p99 band excludes 2% of training data by construction, so a 2% edge-case
   threshold warns on data drawn from the training distribution itself.
+- **A single moment standing in for a distribution.** `consistency_x_volume`
+  warned on every healthy run: a std ratio of 0.62 beside a PSI of 0.0000 and a
+  KS p-value of 1.00. The feature is a product of two others, so its standard
+  deviation is dominated by the tail, and a 40% subsample that misses the tail
+  moves it 38% while the distribution itself is identical. A spread signal is
+  now believed only when PSI and the KS test do not contradict it. That also
+  sharpened four other rows: `label_drift` and `concept_drift` now report
+  `ok` for data distribution shift, which is correct — neither of them touches
+  X at all.
+- **A distance measured against the wrong thing, at a threshold borrowed from
+  the wrong distribution.** The multivariate check took its centre and
+  covariance from the *live batch itself*, so it measured how heavy-tailed that
+  batch was relative to itself and never compared it to training at all. Its
+  cutoff was a chi-squared quantile, which assumes multivariate normality that
+  zero-inflated counts and heavy-tailed products do not have: at chi2(0.999)
+  the **training data itself** came out 3.7% multivariate outliers, against a
+  5% threshold. It now uses the training centre and covariance with the
+  training set's own 99th percentile of distance as the cutoff, so the expected
+  rate is 1% by construction and live is compared against that.
+
+  Fixing it exposed something the check had been hiding: it could not detect
+  the scenario it was paired with. Injecting 5% of rows at (volume p99,
+  consistency p01) — slide 17's exact example, each value normal, the
+  combination impossible — moved the 12-feature rate from 0.79% to 0.79%, and
+  the same rows moved the **pairwise** rate for those two features from 1.18%
+  to 5.99%. A contradiction between two features is a small displacement in
+  twelve dimensions and a large one in the plane where it happens, so the
+  check now looks at the three most correlated pairs as well as the whole
+  space.
 - **A baseline measured on a different population.** The first version used the
   model's test-period ROC-AUC as the concept-drift reference and compared it to
   a training-period holdout. That reported a 0.115 drop on untouched data: the

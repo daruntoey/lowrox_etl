@@ -50,6 +50,17 @@ MISSING_INCREASE = 0.10                   # absolute increase in missing rate
 # occurs by construction.
 EDGE_CASE_RATE = 0.05
 
+# Multi-dimensional edge cases (slide 17's second half): the cutoff is the
+# training set's own quantile of Mahalanobis distance, not a chi-squared
+# quantile. chi-squared assumes multivariate normality, and these features are
+# zero-inflated counts and heavy-tailed products — at chi2(0.999) the TRAINING
+# DATA ITSELF came out 3.7% "multivariate outliers", which was then compared
+# against a 5% threshold and warned on every healthy run. An empirical quantile
+# has a known expected rate instead: 1 - MULTI_QUANTILE, by construction.
+MULTI_QUANTILE = 0.99
+MULTI_RATE_RATIO = 3.0        # live must reach 3x the expected rate to warn
+MULTI_PAIRS = 3               # most-correlated pairs checked individually
+
 # Features that move with the calendar BY CONSTRUCTION. A member's tenure is
 # larger every month; lifetime counters only ever increase. Comparing their
 # level against a training window that ended months ago will report drift on
@@ -134,8 +145,33 @@ def check_data_drift(training_stats: pd.DataFrame, live: pd.DataFrame,
             if len(ref_s) > 20 and len(s) > 20 and ref_s.nunique() > 1:
                 ks_p = float(stats.ks_2samp(ref_s, s).pvalue)
 
-        spread_moved = (std_ratio > SPREAD_RATIO or std_ratio < 1 / SPREAD_RATIO
-                        or iqr_ratio > SPREAD_RATIO or iqr_ratio < 1 / SPREAD_RATIO)
+        # A feature that takes a single value across the live window has no
+        # spread to compare. month_sin and month_cos are constant within any
+        # one monthly snapshot by construction, so testing their 9-month
+        # training spread against a 1-month live slice reports a collapse that
+        # is an artefact of the window width rather than a change in the data —
+        # and it reported one on every healthy run, which is how a monitor
+        # teaches people to ignore it. PSI, the mean shift and the KS test all
+        # still see these features, so nothing is hidden by skipping the
+        # spread term.
+        live_constant = s.nunique() <= 1
+        spread_moved = (not live_constant) and (
+            std_ratio > SPREAD_RATIO or std_ratio < 1 / SPREAD_RATIO
+            or iqr_ratio > SPREAD_RATIO or iqr_ratio < 1 / SPREAD_RATIO)
+
+        # A spread-only signal is believed only when the distribution-level
+        # tests do not contradict it. `std` is one number and the tail
+        # dominates it, so on a heavy-tailed feature a subsample can move it
+        # 40% while PSI is 0.00 and the KS test cannot reject at all — which is
+        # a property of the sample, not of the data. That is what warned on
+        # every healthy run here: consistency_x_volume, a product of two
+        # features, with PSI 0.0000 and KS p 1.00 beside a std ratio of 0.62.
+        # When the whole-distribution evidence and the single moment disagree,
+        # the distribution wins. With no training sample to compare against
+        # there is no such evidence, and then spread is all there is to go on.
+        if (training_sample is not None and feat in training_sample
+                and spread_moved and psi < PSI_WARN and ks_p >= KS_ALPHA):
+            spread_moved = False
         if feat in EXPECTED_TREND:
             # level shifts are expected; a change in SHAPE is not
             severity = "warning" if spread_moved else "expected_trend"
@@ -229,7 +265,8 @@ def check_concept_drift(training_auc: float, live_auc: float | None,
 # --------------------------------------------------------------------------
 # slide 17 — edge cases, uni- and multi-dimensional
 # --------------------------------------------------------------------------
-def check_edge_cases(training_stats: pd.DataFrame, live: pd.DataFrame) -> Finding:
+def check_edge_cases(training_stats: pd.DataFrame, live: pd.DataFrame,
+                     training_sample: pd.DataFrame | None = None) -> Finding:
     rows = []
     for feat, ref in training_stats.iterrows():
         if feat not in live.columns or feat in EXPECTED_TREND:
@@ -247,34 +284,109 @@ def check_edge_cases(training_stats: pd.DataFrame, live: pd.DataFrame) -> Findin
     flagged = uni[uni.outside_train_p01_p99 > EDGE_CASE_RATE]
 
     # Multi-dimensional: each value ordinary on its own, the COMBINATION not.
-    # Mahalanobis distance against the training covariance is the standard way
-    # to ask that question, and it is the one the slide is pointing at when it
-    # says "a combination of variables that may be an edge case when looked at
-    # together".
-    multi_rate = 0.0
-    num = live.select_dtypes(include=[np.number]).dropna(axis=1, how="all")
-    cols = [c for c in num.columns if c in training_stats.index][:12]
-    if len(cols) >= 3 and len(num) > len(cols) + 2:
-        X = num[cols].fillna(num[cols].median())
-        mu = X.mean().values
-        try:
-            inv = np.linalg.pinv(np.cov(X.values, rowvar=False))
-            d = np.einsum("ij,jk,ik->i", X.values - mu, inv, X.values - mu)
-            thresh = stats.chi2.ppf(0.999, df=len(cols))
-            multi_rate = float((d > thresh).mean())
-        except np.linalg.LinAlgError:
-            multi_rate = 0.0
+    multi = _multivariate_edge_cases(training_stats, live, training_sample)
+    worst = max((m["ratio"] for m in multi), default=0.0)
 
     sev = "ok"
-    if len(flagged) or multi_rate > EDGE_CASE_RATE:
+    if len(flagged) or worst >= MULTI_RATE_RATIO:
         sev = "warning"
     if (len(flagged) and flagged.outside_train_p01_p99.max() > 4 * EDGE_CASE_RATE) \
-            or multi_rate > 4 * EDGE_CASE_RATE:
+            or worst >= 2 * MULTI_RATE_RATIO:
         sev = "alert"
+
     detail = (f"{len(flagged)} feature(s) with >{EDGE_CASE_RATE:.0%} of values "
-              f"outside the training range; {multi_rate:.1%} of rows are "
-              f"multivariate outliers")
+              f"outside the training range")
+    if multi:
+        hit = max(multi, key=lambda m: m["ratio"])
+        detail += (f"; worst combination {hit['space']} at {hit['rate']:.1%} vs "
+                   f"{hit['expected']:.1%} expected ({hit['ratio']:.1f}x)")
+    else:
+        detail += "; no training sample, so combinations were not checked"
     return Finding("edge cases (slide 17)", sev, detail, uni.head(10))
+
+
+def _mahalanobis(ref: pd.DataFrame, live: pd.DataFrame, cols: list[str]) -> dict | None:
+    """
+    Share of live rows beyond the training set's own MULTI_QUANTILE of squared
+    Mahalanobis distance, with the rate the training data produces at the same
+    cutoff for comparison.
+
+    Both the centre and the covariance come from the REFERENCE. Taking them
+    from the live batch — which is what the first version did — measures how
+    heavy-tailed this batch is relative to itself and never compares it to
+    training at all, so it answers a question nobody asked.
+    """
+    def prep(df):
+        d = df[cols].apply(pd.to_numeric, errors="coerce")
+        return d.fillna(d.median())
+
+    try:
+        R = prep(ref)
+        if len(R) <= len(cols) + 2 or R.isna().all().any():
+            return None
+        mu = R.mean().values
+        inv = np.linalg.pinv(np.cov(R.values, rowvar=False))
+
+        def d2(frame):
+            X = prep(frame).values
+            return np.einsum("ij,jk,ik->i", X - mu, inv, X - mu)
+
+        cut = float(np.quantile(d2(ref), MULTI_QUANTILE))
+        rate = float((d2(live) > cut).mean())
+    except (np.linalg.LinAlgError, KeyError, ValueError):
+        return None
+    expected = 1.0 - MULTI_QUANTILE
+    return {"rate": rate, "expected": expected, "cutoff": cut,
+            "ratio": rate / expected if expected > 0 else 0.0}
+
+
+def _multivariate_edge_cases(training_stats: pd.DataFrame, live: pd.DataFrame,
+                             training_sample: pd.DataFrame | None) -> list[dict]:
+    """
+    The whole feature space, plus the most correlated PAIRS on their own.
+
+    The pairs matter. Slide 17's example is one value that is normal and
+    another value that is normal with a combination that is not, and a global
+    distance over twelve features barely registers it: injecting 5% of rows at
+    (volume p99, consistency p01) moved the 12-dimensional rate from 0.79% to
+    0.79% — nothing — while the same rows moved the two-dimensional rate for
+    that pair from 1.18% to 5.99%. A contradiction between two features is a
+    small displacement in a twelve-dimensional space and a large one in the
+    plane where it happens.
+    """
+    if training_sample is None:
+        return []
+    num = live.select_dtypes(include=[np.number]).dropna(axis=1, how="all")
+    cols = [c for c in num.columns
+            if c in training_stats.index and c in training_sample.columns][:12]
+    if len(cols) < 3:
+        return []
+
+    out = []
+    g = _mahalanobis(training_sample, live, cols)
+    if g:
+        out.append({**g, "space": f"all {len(cols)} features"})
+
+    # the pairs whose relationship is strong enough for a contradiction to mean
+    # something — an uncorrelated pair has no combination to violate
+    try:
+        corr = training_sample[cols].apply(pd.to_numeric, errors="coerce").corr().abs()
+    except Exception:
+        return out
+    seen, pairs = set(), []
+    for a in cols:
+        for b in cols:
+            if a >= b or (a, b) in seen:
+                continue
+            seen.add((a, b))
+            r = corr.loc[a, b]
+            if pd.notna(r) and r >= 0.5:
+                pairs.append((r, a, b))
+    for _, a, b in sorted(pairs, reverse=True)[:MULTI_PAIRS]:
+        m = _mahalanobis(training_sample, live, [a, b])
+        if m:
+            out.append({**m, "space": f"{a} x {b}"})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -348,7 +460,7 @@ def monitor(*, training_stats: pd.DataFrame, training_sample: pd.DataFrame,
         data,
         check_label_drift(training_positive_rate, live_labels),
         check_concept_drift(training_auc, live_auc, data),
-        check_edge_cases(training_stats, live_features),
+        check_edge_cases(training_stats, live_features, training_sample),
         check_missingness(training_stats, live_features),
         check_feedback_loop(feature_names or list(live_features.columns)),
     ]

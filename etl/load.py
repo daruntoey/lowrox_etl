@@ -110,6 +110,27 @@ def assign_keys(new: pd.DataFrame, existing: pd.DataFrame, key_col: str) -> pd.D
 _FAR_FUTURE = pd.Timestamp.max.tz_localize("UTC")
 
 
+def _to_utc(values) -> pd.Series:
+    """
+    Parse a validity column to UTC without the per-element fallback.
+
+    The SCD2 validity columns mix real ISO timestamps with the open-ended
+    sentinel, and a plain to_datetime() on that mixture makes pandas give up on
+    inferring one format and parse every element through dateutil — slow, and
+    it prints a UserWarning for each call, which on pandas 2 filled the
+    notebook output with the same warning over and over. Saying the format is
+    ISO8601 is both faster and quieter, and errors="coerce" still turns the
+    out-of-range sentinel into NaT for the caller to fill.
+    """
+    if pd.api.types.is_datetime64_any_dtype(values):
+        s = pd.Series(values)
+        return s.dt.tz_localize("UTC") if s.dt.tz is None else s.dt.tz_convert("UTC")
+    try:
+        return pd.to_datetime(values, errors="coerce", utc=True, format="ISO8601")
+    except (ValueError, TypeError):
+        return pd.to_datetime(values, errors="coerce", utc=True)
+
+
 def lookup_scd2(fact: pd.DataFrame, nk_col: str, dim: pd.DataFrame, dim_nk: str,
                 dim_key: str, when: pd.Series, *, absent_key: int = KEY_UNKNOWN) -> pd.Series:
     """
@@ -127,9 +148,9 @@ def lookup_scd2(fact: pd.DataFrame, nk_col: str, dim: pd.DataFrame, dim_nk: str,
         return pd.Series(KEY_UNKNOWN, index=fact.index, dtype="int64")
 
     d = dim[[dim_nk, dim_key, "valid_from", "valid_to"]].copy()
-    d["valid_from"] = pd.to_datetime(d["valid_from"], errors="coerce", utc=True)
+    d["valid_from"] = _to_utc(d["valid_from"])
     # '9999-12-31' overflows a nanosecond timestamp, so the open end is capped
-    d["valid_to"] = pd.to_datetime(d["valid_to"], errors="coerce", utc=True).fillna(_FAR_FUTURE)
+    d["valid_to"] = _to_utc(d["valid_to"]).fillna(_FAR_FUTURE)
     d["valid_from"] = d["valid_from"].fillna(pd.Timestamp.min.tz_localize("UTC"))
 
     probe = pd.DataFrame({

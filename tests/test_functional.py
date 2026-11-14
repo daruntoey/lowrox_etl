@@ -12,6 +12,7 @@ as `python tests/test_functional.py` and under pytest.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -21,8 +22,9 @@ from deltalake import DeltaTable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from etl.config import (GOLD, KEY_INVALID, KEY_NOT_APPLICABLE, KEY_UNKNOWN,
-                        SILVER, SOURCE_TABLES, TABLES_BY_NAME, source_dsn)
+from etl.config import (CONTROL, GOLD, KEY_INVALID, KEY_NOT_APPLICABLE,
+                        KEY_UNKNOWN, SILVER, SOURCE_TABLES, TABLES_BY_NAME,
+                        source_dsn)
 from etl.errors import DeadLetterQueue
 from etl.lineage import LineageRegistry
 from etl.preflight import connect as _connect, require_gold
@@ -40,6 +42,32 @@ def _sql(query: str, params=()) -> pd.DataFrame:
     with _connect() as conn, conn.cursor() as cur:
         cur.execute(query, params)
         return pd.DataFrame(cur.fetchall(), columns=[d[0] for d in cur.description])
+
+
+def _quarantined_ids(table: str) -> set[int]:
+    """
+    The primary keys this run sent to the dead letter queue for one table.
+
+    The DLQ record keeps the whole rejected row plus `_src_table`, `_dlq_stage`
+    and `_dlq_reason`, so the test can ask the pipeline what it dropped instead
+    of assuming.
+    """
+    f = CONTROL / "dead_letter.jsonl"
+    if not f.exists():
+        return set()
+    ids = set()
+    for line in f.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (row.get("_src_table") == table
+                and row.get("_dlq_reason") == "dq_rule_failed"
+                and row.get("id") is not None):
+            ids.add(int(row["id"]))
+    return ids
 
 
 def _delta(path) -> pd.DataFrame:
@@ -336,9 +364,22 @@ def test_end_to_end():
                  .round(1).reset_index())
 
     gold_total = float(f["distance_km"].sum())
-    src_total = float(_sql(
-        "SELECT COALESCE(sum(distance_km),0) AS km FROM txn_workout_summaries "
-        "WHERE id NOT IN (SELECT unnest(ARRAY[7,19,31,42,48]))").iloc[0]["km"])
+    # Which rows were quarantined is read back from the pipeline's own dead
+    # letter queue, not typed in here. An earlier version hard-coded the five
+    # ids that fail the DQ rules in the 50-row dataset, which made the test
+    # pass only at that one scale — it failed the moment the same pipeline ran
+    # against 2,000 rows, where 176 different rows are quarantined. Deriving
+    # the list is also a stronger claim: Gold equals the source minus exactly
+    # the rows the pipeline SAYS it dropped.
+    quarantined = _quarantined_ids("txn_workout_summaries")
+    if quarantined:
+        src_total = float(_sql(
+            "SELECT COALESCE(sum(distance_km),0) AS km FROM txn_workout_summaries "
+            "WHERE id <> ALL(%s)", (list(quarantined),)).iloc[0]["km"])
+    else:
+        src_total = float(_sql(
+            "SELECT COALESCE(sum(distance_km),0) AS km "
+            "FROM txn_workout_summaries").iloc[0]["km"])
     ok = check("end-to-end: Gold total distance = source minus quarantined",
                abs(gold_total - src_total) < 0.01,
                f"gold {gold_total:.2f} km vs source {src_total:.2f} km", "End to end")
