@@ -365,6 +365,12 @@ def load_fct_workout_session(dims: dict, cfg: RunConfig, run_id: str, log: Error
         if len(existing):
             out = (pd.concat([existing, f], ignore_index=True)
                      .drop_duplicates(subset=["workout_id"], keep="last"))
+            # A run the member deleted in the app is gone from Silver
+            # (transform.drop_deleted); the fact follows it.
+            removed = ~out["workout_id"].isin(src["id"].astype("int64"))
+            if removed.any():
+                log.info(f"fct_workout_session: {int(removed.sum())} deleted run(s) removed")
+                out = out[~removed]
         else:
             out = f
         version = write_gold("fct_workout_session", out, log)
@@ -453,7 +459,9 @@ def load_gold(cfg: RunConfig, run_id: str, log: ErrorLog, metrics: MetricsCollec
         dims["dim_workout_type"] = load_dim_type1(
             "dim_workout_type", "workout_type_key", "activity_type",
             workouts[["activity_type"]].assign(
-                is_cardio=workouts["activity_type"].isin(["run", "ride", "swim", "walk"])
+                # the source codes (Silver is lower-cased), not short forms
+                is_cardio=workouts["activity_type"].isin(
+                    ["running", "cycling", "swimming", "walking", "hyrox_prep"])
             ) if len(workouts) else pd.DataFrame(),
             ["is_cardio"], log)
         dims["dim_device"] = load_dim_type1(
@@ -464,11 +472,17 @@ def load_gold(cfg: RunConfig, run_id: str, log: ErrorLog, metrics: MetricsCollec
             "dim_area", "area_key", "area_label",
             areas[["area_label", "area_type"]] if len(areas) else pd.DataFrame(),
             ["area_type"], log)
+        # title / target_level / is_party / visibility come from the web app
+        # (04_frontend_integration.sql); a source without them still loads.
+        event_attrs = ["workout_type", "status"] + [
+            c for c in ("title", "target_level", "is_party", "visibility")
+            if c in events.columns]
         dims["dim_event"] = load_dim_type1(
             "dim_event", "event_key", "event_id",
-            events.rename(columns={"id": "event_id"})[["event_id", "workout_type", "status"]]
+            events.rename(columns={"id": "event_id"})[["event_id"] + event_attrs]
+                  .fillna({"title": "", "target_level": "", "visibility": ""})
             if len(events) else pd.DataFrame(),
-            ["workout_type", "status"], log)
+            event_attrs, log)
         dims["dim_plan"] = load_dim_type1(
             "dim_plan", "plan_key", "plan_id",
             plans.rename(columns={"id": "plan_id"})[["plan_id", "plan_code", "tier"]]

@@ -190,11 +190,17 @@ def _seed(db: str, scale: int, project_dir: Path, verbose: bool) -> int:
     if g.returncode != 0:
         raise RuntimeError(f"generate.py --scale {scale} failed:\n{g.stderr[-1500:]}")
 
-    schema = project_dir / "sql" / "01_schema.sql"
+    sql = project_dir / "sql"
+    schema = sql / "01_schema.sql"
     seed = project_dir / "out" / "02_seed.sql"
     if not seed.exists():
         raise RuntimeError(f"the generator did not write {seed}")
-    for f in (schema, seed):
+    # After the seed, the same steps Supabase has had: auth + RLS (03), the web
+    # app's columns, RPCs and tables (04) and LINE Login (06). The stub stands
+    # in for the auth/storage schemas a plain PostgreSQL does not have.
+    supabase_steps = [sql / f for f in ("00_supabase_local_stub.sql", "03_auth_and_rls.sql",
+                                        "04_frontend_integration.sql", "06_line_login.sql")]
+    for f in (schema, seed, *supabase_steps):
         # The files are read by the postgres system user, which cannot see a
         # project folder that is only readable by its owner.
         try:

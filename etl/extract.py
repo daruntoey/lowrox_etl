@@ -77,6 +77,42 @@ def reset_watermarks() -> None:
 
 
 # --------------------------------------------------------------------------
+# Source key snapshots — how a hard delete in the source reaches Silver
+# --------------------------------------------------------------------------
+# An incremental extract filters on a watermark, so it only ever sees rows that
+# still exist. For tables the web app deletes from (config: hard_deletes) the
+# extract also reads the full list of primary keys, which is cheap, and the
+# transform drops Silver rows whose key is no longer in it. Keys are written in
+# the same "a|b" text form as the _src_pk lineage column, so the two compare
+# directly.
+SOURCE_KEYS_DIR = Path(CONTROL) / "source_keys"
+
+
+def _key_text(values) -> str:
+    return "|".join(str(v) for v in values)
+
+
+def write_source_keys(table: str, run_id: str, keys: list[str]) -> None:
+    SOURCE_KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    path = SOURCE_KEYS_DIR / f"{table}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"run_id": run_id, "keys": keys}))
+    os.replace(tmp, path)
+
+
+def read_source_keys(table: str, run_id: str) -> set[str] | None:
+    """The key snapshot taken by THIS run, or None if there is none."""
+    path = SOURCE_KEYS_DIR / f"{table}.json"
+    if not path.exists():
+        return None
+    try:
+        snap = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    return set(snap["keys"]) if snap.get("run_id") == run_id else None
+
+
+# --------------------------------------------------------------------------
 # Type mapping — an explicit Arrow schema per table keeps Bronze stable even
 # when a batch happens to be all-NULL in some column.
 # --------------------------------------------------------------------------
@@ -142,8 +178,16 @@ def _nullsafe(values, is_float: bool):
 
 def _stringify(values):
     """PostgreSQL `time` and a few other types arrive as Python objects that
-    Arrow will not accept into a string column. Render them, keeping None."""
-    return [None if v is None else (v if isinstance(v, str) else str(v)) for v in values]
+    Arrow will not accept into a string column. Render them, keeping None.
+    jsonb (dict / list) and array columns become JSON text, not Python's repr,
+    so anything downstream can parse them back."""
+    def one(v):
+        if v is None or isinstance(v, str):
+            return v
+        if isinstance(v, (dict, list, tuple)):
+            return json.dumps(v, ensure_ascii=False, default=str)
+        return str(v)
+    return [one(v) for v in values]
 
 
 def _coerce(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
@@ -188,7 +232,8 @@ def extract_table(tbl: SourceTable, cfg: RunConfig, run_id: str,
                 # pooler and tripping its circuit breaker.
                 raise classify_connection_error(exc) from exc
             try:
-                cols = describe_source(conn, tbl.name)
+                cols = [c for c in describe_source(conn, tbl.name)
+                        if c[0] not in tbl.exclude_cols]
                 colnames = [c for c, _ in cols]
                 sql = f'SELECT {", ".join(colnames)} FROM {tbl.name}'
                 params: tuple = ()
@@ -199,11 +244,18 @@ def extract_table(tbl: SourceTable, cfg: RunConfig, run_id: str,
                 with conn.cursor() as cur:
                     cur.execute(sql, params)
                     rows = cur.fetchall()
-                return pd.DataFrame(rows, columns=colnames), cols
+                    keys = None
+                    if tbl.hard_deletes:
+                        # Read after the rows: a row deleted in between is
+                        # extracted and then dropped from Silver, which is right;
+                        # a row inserted in between is simply kept.
+                        cur.execute(f'SELECT {", ".join(tbl.pk)} FROM {tbl.name}')
+                        keys = [_key_text(r) for r in cur.fetchall()]
+                return pd.DataFrame(rows, columns=colnames), cols, keys
             finally:
                 conn.close()
 
-        (df, cols), attempts = retry(
+        (df, cols, keys), attempts = retry(
             _read, attempts=cfg.retry_attempts, base_delay=cfg.retry_base_delay,
             max_delay=cfg.retry_max_delay, logger=log, label=f"extract {tbl.name}",
         )
@@ -227,6 +279,9 @@ def extract_table(tbl: SourceTable, cfg: RunConfig, run_id: str,
             raise SchemaDriftError(
                 f"{tbl.name}: source contract declares {sorted(missing)} but the "
                 f"extract returned {len(df.columns)} columns without them")
+
+        if keys is not None:
+            write_source_keys(tbl.name, run_id, keys)
 
         if df.empty:
             m.rows_out = 0
@@ -365,7 +420,7 @@ def _report_credential_failure(exc: Exception, log: ErrorLog) -> None:
         print(f"user : {user}")
         print(f"\n{str(exc).strip().splitlines()[0]}")
         print("\nExtraction was stopped after the FIRST failure rather than")
-        print("retried across all 18 tables, because a wrong credential cannot")
+        print("retried across all 19 tables, because a wrong credential cannot")
         print("succeed on a retry and repeated attempts trip the pooler's")
         print("circuit breaker (10 failures / 150s -> 120s lockout).")
         print("\nCheck, in this order:")

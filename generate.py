@@ -628,6 +628,7 @@ def gen_notifications(users, events, n):
 # ---------------------------------------------------------------------------
 def write_source_mock(raw, devices, payments, users):
     d = OUT / "source_mock"
+    d.mkdir(parents=True, exist_ok=True)
     dev_by_id = {x["id"]: x for x in devices}
 
     apple, strava = [], []
@@ -722,6 +723,8 @@ def clean(rows):
 
 
 def write_csv():
+    # out/ is git-ignored, so a fresh clone has no out/csv to write into
+    (OUT / "csv").mkdir(parents=True, exist_ok=True)
     for t in ORDER:
         rows = clean(TABLES[t])
         with open(OUT / "csv" / f"{t}.csv", "w", newline="", encoding="utf-8") as f:

@@ -103,7 +103,7 @@ def sim_1_transient_source_failure(verbose: bool = True):
 def sim_2_permanent_source_failure_is_isolated(verbose: bool = True):
     """
     One table's source stays down for good.
-    Expected: that table is quarantined and alerted, the other 17 still load.
+    Expected: that table is quarantined and alerted, the other 18 still load.
     A single bad table must not become an outage for the whole warehouse.
     """
     if verbose:
@@ -123,11 +123,11 @@ def sim_2_permanent_source_failure_is_isolated(verbose: bool = True):
           and workouts_rows == _source_rows("txn_workout_summaries")
           and len(loaded) >= 16 and critical)
     if verbose:
-        print(f"\n  tables that still loaded : {len(loaded)} of 18")
+        print(f"\n  tables that still loaded : {len(loaded)} of 19")
         print(f"  txn_payments in bronze   : {payments_rows} (expected 0)")
         print(f"  txn_workout_summaries    : {workouts_rows} (unaffected)")
         print(f"  critical alerts raised   : {len(critical)}")
-    record("2. Permanent source failure", "1 table fails, 17 unaffected, alert raised",
+    record("2. Permanent source failure", "1 table fails, 18 unaffected, alert raised",
            f"{len(loaded)} tables loaded, payments={payments_rows}, "
            f"{len(critical)} critical alert(s)", bool(ok))
     assert ok
