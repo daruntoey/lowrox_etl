@@ -31,7 +31,7 @@ def source_dsn() -> str:
     imported. In a notebook that is a trap: import etl once with the default,
     set LOWROX_SOURCE_DSN afterwards, and the setup cell's own connection test
     passes while the extractor keeps talking to the old database — which looks
-    like 18 inexplicable extraction failures rather than a configuration
+    like 19 inexplicable extraction failures rather than a configuration
     mistake.
     """
     return os.environ.get("LOWROX_SOURCE_DSN", _DEFAULT_DSN)
@@ -84,6 +84,15 @@ class SourceTable:
     watermark_col: str          # the column the incremental extract filters on
     is_append_only: bool        # True -> rows are never updated after insert
     sensitive: bool = False     # PDPA s.26 — never promoted past restricted Silver
+    # Columns the extract never reads. ms_users.onboarding_data is the web app's
+    # copy of the onboarding form for re-editing; it repeats the health answers
+    # that live in txn_user_medical_concerns, so it must not enter the open lake.
+    exclude_cols: tuple[str, ...] = ()
+    # The web app hard-deletes rows in these tables (leave a party, delete a
+    # run, re-save onboarding, disconnect a device). A watermark only sees rows
+    # that still exist, so each run also snapshots the source keys and Silver
+    # drops what the source no longer has.
+    hard_deletes: bool = False
 
     @property
     def bronze_path(self) -> str:
@@ -94,28 +103,35 @@ class SourceTable:
         return str(SILVER / self.name)
 
 
-# The 18 OLTP tables. watermark_col is 'updated_at' wherever the source
+# The 19 OLTP tables. watermark_col is 'updated_at' wherever the source
 # maintains one; txn_workout_summaries is append-only from the device feed and
-# has only created_at, which is the correct watermark for it.
+# has only created_at, which is the correct watermark for it, and so is
+# txn_plan_checkoffs (a tick on the weekly plan is inserted or deleted, never
+# updated). The schema they follow is sql/01 + 03 + 04 + 06, i.e. what the web
+# app (aom-thanya/lowrox) reads and writes on Supabase.
 SOURCE_TABLES: list[SourceTable] = [
-    SourceTable("ms_users",                ("id",),      "updated_at", False),
+    SourceTable("ms_users",                ("id",),      "updated_at", False,
+                exclude_cols=("onboarding_data",)),
     SourceTable("ms_user_demographics",    ("user_id",), "updated_at", False),
     SourceTable("ms_user_verifications",   ("id",),      "updated_at", False),
     SourceTable("ms_area",                 ("id",),      "updated_at", False),
     SourceTable("ms_subscription_plans",   ("id",),      "updated_at", False),
-    SourceTable("ms_device_connections",   ("id",),      "updated_at", False),
+    SourceTable("ms_device_connections",   ("id",),      "updated_at", False, hard_deletes=True),
     SourceTable("txn_events",              ("id",),      "updated_at", False),
-    SourceTable("txn_workout_summaries",   ("id",),      "created_at", True),
+    SourceTable("txn_workout_summaries",   ("id",),      "created_at", True, hard_deletes=True),
     SourceTable("txn_user_history_level",  ("id",),      "updated_at", False),
-    SourceTable("txn_user_goals",          ("id",),      "updated_at", False),
-    SourceTable("txn_user_medical_concerns", ("id",),    "updated_at", False, sensitive=True),
-    SourceTable("txn_user_constraints",    ("id",),      "updated_at", False),
-    SourceTable("txn_event_participants",  ("id",),      "updated_at", False),
+    SourceTable("txn_user_goals",          ("id",),      "updated_at", False, hard_deletes=True),
+    SourceTable("txn_user_medical_concerns", ("id",),    "updated_at", False, sensitive=True,
+                hard_deletes=True),
+    SourceTable("txn_user_constraints",    ("id",),      "updated_at", False, hard_deletes=True),
+    SourceTable("txn_event_participants",  ("id",),      "updated_at", False, hard_deletes=True),
     SourceTable("txn_group_comments",      ("id",),      "updated_at", False),
     SourceTable("txn_training_plans",      ("id",),      "updated_at", False),
     SourceTable("txn_user_subscriptions",  ("id",),      "updated_at", False),
     SourceTable("txn_payments",            ("id",),      "updated_at", False),
     SourceTable("txn_notifications",       ("id",),      "updated_at", False),
+    SourceTable("txn_plan_checkoffs",      ("user_id", "week_start", "session_id"),
+                "created_at", True, hard_deletes=True),
 ]
 
 TABLES_BY_NAME = {t.name: t for t in SOURCE_TABLES}

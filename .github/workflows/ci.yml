@@ -36,8 +36,10 @@ jobs:
       - name: Seed the test database
         env: { PGPASSWORD: lowrox }
         run: |
-          psql -h localhost -U lowrox -d lowrox -f sql/01_schema.sql
-          psql -h localhost -U lowrox -d lowrox -f sql/02_seed.sql
+          # the same public schema as Supabase: 01 + 02, then 03/04/06 on a stub of auth/storage
+          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login; do
+            psql -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f sql/$f.sql
+          done
       - name: ETL test suites
         env:
           LOWROX_SOURCE_DSN: postgresql://lowrox:lowrox@localhost:5432/lowrox
@@ -49,6 +51,7 @@ jobs:
                      assert r.ok, 'init load failed'"
           python tests/test_functional.py
           python tests/test_incremental.py
+          python tests/test_app_contract.py
           python tests/test_error_handling.py
 
   data-and-model:
@@ -76,8 +79,10 @@ jobs:
       - name: Seed
         env: { PGPASSWORD: lowrox }
         run: |
-          psql -h localhost -U lowrox -d lowrox -f sql/01_schema.sql
-          psql -h localhost -U lowrox -d lowrox -f sql/02_seed.sql
+          # the same public schema as Supabase: 01 + 02, then 03/04/06 on a stub of auth/storage
+          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login; do
+            psql -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f sql/$f.sql
+          done
       - name: Validate data, schema and model
         env:
           LOWROX_SOURCE_DSN: postgresql://lowrox:lowrox@localhost:5432/lowrox

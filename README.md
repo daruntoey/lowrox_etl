@@ -23,7 +23,7 @@ mlops/               MLOps and the feature store (Chapter 7)
 lowrox_mlops_demo.ipynb  the MLOps notebook, executed
 
 etl/                 the ETL pipeline
-  config.py          where things live, the 18-table registry
+  config.py          where things live, the 19-table registry
   lineage.py         row-level stamps + the run-level edge registry
   metrics.py         timing and throughput, measured not estimated
   errors.py          retry / error log / dead-letter queue / alerting
@@ -37,6 +37,7 @@ tests/
   test_performance.py      6 checks: throughput, latency, scaling, parallelism
   test_error_handling.py   6 live fault simulations
   test_incremental.py      6 checks: init vs incremental, SCD2, replay
+  test_app_contract.py     7 checks: what the web app writes, end to end
 lowrox_etl_demo.ipynb      the whole thing, executed, with outputs
 build_notebook.py          regenerates the notebook
 ```
@@ -169,6 +170,50 @@ export LOWROX_LAKE_ROOT="./lowrox_lake"
 
 Keep the password out of the notebook you submit. Read it from an environment
 variable or Colab's secrets manager.
+
+---
+
+## The web app writes to the same tables
+
+The Lowrox web app ([aom-thanya/lowrox](https://github.com/aom-thanya/lowrox),
+lowrox.vercel.app) reads and writes the Supabase tables this pipeline extracts.
+Its schema additions live here too, so this folder is the single record of what
+the database holds.
+
+**Order on Supabase** (SQL Editor). Re-running 04 restores its own sign-up
+trigger, so run 06 again after any re-run of 04.
+
+| step | file | what it adds |
+| --- | --- | --- |
+| 1 | `sql/01_schema.sql` | the 18 OLTP tables |
+| 2 | `sql/02_seed.sql` | 50 mock members |
+| 3 | `sql/03_auth_and_rls.sql` | Supabase Auth link + RLS |
+| 4 | `sql/04_frontend_integration.sql` | profile and event columns, RPCs, storage, `txn_plan_checkoffs` |
+| 5 | `sql/06_line_login.sql` | `ms_users.line_user_id`, LINE-aware sign-up trigger |
+| check | `sql/verify_web_contract.sql` | read-only; every row should say `ok = true` |
+
+On a plain PostgreSQL (local source, CI) run `sql/00_supabase_local_stub.sql`
+between 02 and 03: it stands in for Supabase's `auth` and `storage` schemas.
+`local_source.py` and `ci.yml` already do this. Never run the stub on Supabase.
+
+**What the pipeline does with the app's data**
+
+| app behaviour | pipeline rule | where |
+| --- | --- | --- |
+| keeps a copy of the onboarding form, health answers included, in `ms_users.onboarding_data` | never extracted (PDPA s.26); the answers reach the lake only through `txn_user_medical_concerns`, in restricted Silver | `config.exclude_cols` |
+| hard-deletes rows (leave a party, delete a run, re-save onboarding, disconnect a device, untick the plan) | each run snapshots the source keys; Silver drops what the source no longer has, and `fct_workout_session` follows | `config.hard_deletes`, `transform.drop_deleted` |
+| accepts runs of 0.5–100 km no faster than 2:30 min/km | the quality gate uses the same bounds; it also quarantines slower than 30 min/km (a stopwatch left running) | `transform.DQ_RULES` |
+| writes jsonb and arrays (`interests`, comment `images`) | Bronze stores them as JSON text | `extract._stringify` |
+| signs members in with LINE only (Edge Function `line-auth` + 06); a member who does not share an email gets `<line id>@line.lowrox.app` | `line_user_id` and the email stay in Silver; Gold's `dim_user` carries only the one-way `email_token` | `load.load_dim_user` |
+| adds columns over time (06's `line_user_id`) | Silver merges with schema evolution, so new columns arrive | `transform` merge |
+| events gain `title`, `target_level`, `is_party`, `visibility`; status `draft` | carried into `dim_event`; DQ knows the statuses | `load`, `transform` |
+
+`tests/test_app_contract.py` pins all of the above (7 checks).
+
+> **Real members exist now.** Members 51 and 52 signed up through the web app.
+> `test_incremental.py` and `test_app_contract.py` write to the source and are
+> meant for mock data: run them against a local copy, not against Supabase,
+> and stop setting `LOWROX_ALLOW_SOURCE_WRITES=1` for the Supabase notebook.
 
 ---
 

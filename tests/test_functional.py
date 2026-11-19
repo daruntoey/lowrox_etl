@@ -195,7 +195,7 @@ def test_source_to_target_counts():
                      "match": src == got})
     df = pd.DataFrame(rows)
     bad = df[~df["match"]]
-    ok = check("source-to-target: row counts match on all 18 tables", bad.empty,
+    ok = check("source-to-target: row counts match on all 19 tables", bad.empty,
                f"{len(df)} tables, {df['oltp'].sum()} source rows"
                + ("" if bad.empty else f", mismatch on {list(bad.table)}"),
                "Source to target")
@@ -211,13 +211,18 @@ def test_source_to_target_values():
     src = _sql("SELECT id, distance_km, duration_sec, avg_heart_rate, calories_kcal "
                f"FROM txn_workout_summaries WHERE id IN %s", (ids,)).set_index("id")
 
+    # Runs logged in the web app have no heart rate or calories; Gold stores
+    # those as 0 (load_fct_workout_session), so a NULL in the source is 0 here.
+    def n(v) -> int:
+        return 0 if pd.isna(v) else int(v)
+
     diffs = []
     for _, r in sample.iterrows():
         o = src.loc[int(r["workout_id"])]
         if (abs(float(o["distance_km"]) - r["distance_km"]) > 1e-9
-                or int(o["duration_sec"]) != int(r["duration_sec"])
-                or int(o["avg_heart_rate"]) != int(r["avg_heart_rate"])
-                or int(o["calories_kcal"]) != int(r["calories_kcal"])):
+                or n(o["duration_sec"]) != n(r["duration_sec"])
+                or n(o["avg_heart_rate"]) != n(r["avg_heart_rate"])
+                or n(o["calories_kcal"]) != n(r["calories_kcal"])):
             diffs.append(int(r["workout_id"]))
     ok = check("source-to-target: measures identical on a 25-row sample", not diffs,
                f"compared 4 measures x {len(sample)} rows"
