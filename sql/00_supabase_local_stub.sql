@@ -3,12 +3,12 @@
 --
 -- Supabase ships the auth and storage schemas and the anon /
 -- authenticated roles. A plain PostgreSQL (the local source, CI) has
--- none of them, so 03, 04 and 06 would fail there. This file adds the
+-- none of them, so 03, 04, 06 and 07 would fail there. This file adds the
 -- smallest stand-ins those scripts reference, so the local source gets
 -- exactly the same public schema as Supabase.
 --
 -- Order on a plain PostgreSQL:
---   01_schema → 02_seed → 00_supabase_local_stub → 03 → 04 → 06
+--   01_schema → 02_seed → 00_supabase_local_stub → 03 → 04 → 06 → 07
 -- ใช้เฉพาะเครื่อง local / CI เท่านั้น ห้ามรันบน Supabase
 -- ============================================================
 DO $$ BEGIN

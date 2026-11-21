@@ -190,11 +190,12 @@ trigger, so run 06 again after any re-run of 04.
 | 3 | `sql/03_auth_and_rls.sql` | Supabase Auth link + RLS |
 | 4 | `sql/04_frontend_integration.sql` | profile and event columns, RPCs, storage, `txn_plan_checkoffs` |
 | 5 | `sql/06_line_login.sql` | `ms_users.line_user_id`, LINE-aware sign-up trigger |
+| 6 | `sql/07_storage_select_policy.sql` | lets members see, and so remove, their own uploads in `avatars` / `comment-images` |
 | check | `sql/verify_web_contract.sql` | read-only; every row should say `ok = true` |
 
 On a plain PostgreSQL (local source, CI) run `sql/00_supabase_local_stub.sql`
 between 02 and 03: it stands in for Supabase's `auth` and `storage` schemas.
-`local_source.py` and `ci.yml` already do this. Never run the stub on Supabase.
+`local_source.py` and `ci.yml` already do this, in the order above. Never run the stub on Supabase.
 
 **What the pipeline does with the app's data**
 
