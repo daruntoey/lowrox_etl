@@ -48,7 +48,13 @@ WITH checks(item, ok, fix) AS (
   ('06 LINE: sign-up trigger stores line_user_id',
      EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'handle_new_user'
              AND prosrc LIKE '%line_user_id%'),
-     'sql/06_line_login.sql')
+     'sql/06_line_login.sql'),
+  ('07 storage: members can see (and so remove) their own uploads',
+     (SELECT count(*) = 4 FROM pg_policies
+      WHERE schemaname = 'storage' AND tablename = 'objects'
+        AND policyname IN ('lowrox_own_uploads_insert', 'lowrox_own_uploads_update',
+                           'lowrox_own_uploads_delete', 'lowrox_own_uploads_select')),
+     'sql/07_storage_select_policy.sql')
 )
 SELECT item, ok, CASE WHEN ok THEN '' ELSE 'run ' || fix END AS action
 FROM checks;

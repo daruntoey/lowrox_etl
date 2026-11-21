@@ -36,8 +36,8 @@ jobs:
       - name: Seed the test database
         env: { PGPASSWORD: lowrox }
         run: |
-          # the same public schema as Supabase: 01 + 02, then 03/04/06 on a stub of auth/storage
-          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login; do
+          # the same public schema as Supabase: 01 + 02, then 03/04/06/07 on a stub of auth/storage
+          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login 07_storage_select_policy; do
             psql -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f sql/$f.sql
           done
       - name: ETL test suites
@@ -79,8 +79,8 @@ jobs:
       - name: Seed
         env: { PGPASSWORD: lowrox }
         run: |
-          # the same public schema as Supabase: 01 + 02, then 03/04/06 on a stub of auth/storage
-          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login; do
+          # the same public schema as Supabase: 01 + 02, then 03/04/06/07 on a stub of auth/storage
+          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login 07_storage_select_policy; do
             psql -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f sql/$f.sql
           done
       - name: Validate data, schema and model
