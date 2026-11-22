@@ -54,7 +54,17 @@ WITH checks(item, ok, fix) AS (
       WHERE schemaname = 'storage' AND tablename = 'objects'
         AND policyname IN ('lowrox_own_uploads_insert', 'lowrox_own_uploads_update',
                            'lowrox_own_uploads_delete', 'lowrox_own_uploads_select')),
-     'sql/07_storage_select_policy.sql')
+     'sql/07_storage_select_policy.sql'),
+  ('08 map: txn_events.meeting_lat / meeting_lng',
+     (SELECT count(*) = 2 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'txn_events'
+        AND column_name IN ('meeting_lat', 'meeting_lng')),
+     'sql/08_party_meeting_point.sql'),
+  ('08 map: exactly one create_party, and it takes the meeting point',
+     (SELECT count(*) = 1 AND bool_and(pg_get_function_identity_arguments(p.oid) LIKE '%p_meeting_lat%')
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = 'create_party'),
+     'sql/08_party_meeting_point.sql (again, if 04 was re-run)')
 )
 SELECT item, ok, CASE WHEN ok THEN '' ELSE 'run ' || fix END AS action
 FROM checks;
@@ -65,4 +75,6 @@ UNION ALL SELECT 'members linked to LINE', count(*) FROM ms_users
   WHERE to_jsonb(ms_users) ? 'line_user_id' AND to_jsonb(ms_users) ->> 'line_user_id' IS NOT NULL
 UNION ALL SELECT 'runs logged in the app', count(*) FROM txn_workout_summaries WHERE source IN ('log', 'onboarding')
 UNION ALL SELECT 'parties hosted in the app', count(*) FROM txn_events WHERE title IS NOT NULL
-UNION ALL SELECT 'weekly plan ticks', count(*) FROM txn_plan_checkoffs;
+UNION ALL SELECT 'weekly plan ticks', count(*) FROM txn_plan_checkoffs
+UNION ALL SELECT 'parties with a map pin', count(*) FROM txn_events
+  WHERE to_jsonb(txn_events) ->> 'meeting_lat' IS NOT NULL;

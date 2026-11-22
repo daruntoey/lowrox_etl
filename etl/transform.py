@@ -72,6 +72,18 @@ def _distance_plausible(df):
     return (is_distance & ok_distance) | (~is_distance & ok_other)
 
 
+def _meeting_point_valid(df):
+    """Both coordinates or neither, inside WGS84 range (sql/08_party_meeting_point.sql).
+    A source from before 08 has no such columns: nothing to check."""
+    if "meeting_lat" not in df.columns or "meeting_lng" not in df.columns:
+        return pd.Series(True, index=df.index)
+    lat = pd.to_numeric(df["meeting_lat"], errors="coerce")
+    lng = pd.to_numeric(df["meeting_lng"], errors="coerce")
+    neither = lat.isna() & lng.isna()
+    both = lat.between(-90, 90) & lng.between(-180, 180)
+    return neither | both
+
+
 def _run_pace_plausible(df):
     """2:30-30:00 min/km. Faster is beyond world-record pace (the app refuses it
     too); slower is a forgotten stopwatch."""
@@ -117,6 +129,7 @@ DQ_RULES: dict[str, list[tuple]] = {
             ["draft", "scheduled", "full", "completed", "cancelled"])),
         ("visibility_known", lambda df: df["visibility"].isna()
             | df["visibility"].str.lower().isin(["public", "private"])),
+        ("meeting_point_valid", _meeting_point_valid),
     ],
     "txn_plan_checkoffs": [
         ("user_id_present", _not_null("user_id")),
