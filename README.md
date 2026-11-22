@@ -181,7 +181,8 @@ Its schema additions live here too, so this folder is the single record of what
 the database holds.
 
 **Order on Supabase** (SQL Editor). Re-running 04 restores its own sign-up
-trigger, so run 06 again after any re-run of 04.
+trigger and the 8-argument `create_party`, so run 06, 07 and 08 again after
+any re-run of 04.
 
 | step | file | what it adds |
 | --- | --- | --- |
@@ -191,6 +192,7 @@ trigger, so run 06 again after any re-run of 04.
 | 4 | `sql/04_frontend_integration.sql` | profile and event columns, RPCs, storage, `txn_plan_checkoffs` |
 | 5 | `sql/06_line_login.sql` | `ms_users.line_user_id`, LINE-aware sign-up trigger |
 | 6 | `sql/07_storage_select_policy.sql` | lets members see, and so remove, their own uploads in `avatars` / `comment-images` |
+| 7 | `sql/08_party_meeting_point.sql` | `txn_events.meeting_lat` / `meeting_lng` and `create_party(..., p_meeting_lat, p_meeting_lng)` for the party map pin; run it before merging the web change |
 | check | `sql/verify_web_contract.sql` | read-only; every row should say `ok = true` |
 
 On a plain PostgreSQL (local source, CI) run `sql/00_supabase_local_stub.sql`
@@ -208,8 +210,9 @@ between 02 and 03: it stands in for Supabase's `auth` and `storage` schemas.
 | signs members in with LINE only (Edge Function `line-auth` + 06); a member who does not share an email gets `<line id>@line.lowrox.app` | `line_user_id` and the email stay in Silver; Gold's `dim_user` carries only the one-way `email_token` | `load.load_dim_user` |
 | adds columns over time (06's `line_user_id`) | Silver merges with schema evolution, so new columns arrive | `transform` merge |
 | events gain `title`, `target_level`, `is_party`, `visibility`; status `draft` | carried into `dim_event`; DQ knows the statuses | `load`, `transform` |
+| hosts drop a map pin on the meeting point (08) | both coordinates or neither, inside WGS84, else quarantined; the pin is carried into `dim_event` | `transform.DQ_RULES`, `load` |
 
-`tests/test_app_contract.py` pins all of the above (7 checks).
+`tests/test_app_contract.py` pins all of the above (9 checks).
 
 > **Real members exist now.** Members 51 and 52 signed up through the web app.
 > `test_incremental.py` and `test_app_contract.py` write to the source and are

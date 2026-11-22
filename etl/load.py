@@ -475,12 +475,15 @@ def load_gold(cfg: RunConfig, run_id: str, log: ErrorLog, metrics: MetricsCollec
         # title / target_level / is_party / visibility come from the web app
         # (04_frontend_integration.sql); a source without them still loads.
         event_attrs = ["workout_type", "status"] + [
-            c for c in ("title", "target_level", "is_party", "visibility")
+            c for c in ("title", "target_level", "is_party", "visibility",
+                        "meeting_lat", "meeting_lng")  # 08: the party's map pin
             if c in events.columns]
         dims["dim_event"] = load_dim_type1(
             "dim_event", "event_key", "event_id",
             events.rename(columns={"id": "event_id"})[["event_id"] + event_attrs]
-                  .fillna({"title": "", "target_level": "", "visibility": ""})
+                  .astype({c: "object" for c in ("meeting_lat", "meeting_lng") if c in events.columns})
+                  .fillna({"title": "", "target_level": "", "visibility": "",
+                           "meeting_lat": "", "meeting_lng": ""})
             if len(events) else pd.DataFrame(),
             event_attrs, log)
         dims["dim_plan"] = load_dim_type1(

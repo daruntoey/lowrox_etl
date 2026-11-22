@@ -14,6 +14,8 @@ this pipeline extracts, through sql/04_frontend_integration.sql and
      onboarding) leaves Silver and Gold on the next incremental run
   5. a column added in Supabase reaches Silver instead of being dropped
   6. the weekly plan table is extracted
+  7. a party's map pin (08_party_meeting_point.sql) passes the gate only as a
+     whole, in range pin, and reaches Silver and Gold dim_event
 
 Like the other suites it works as `python tests/test_app_contract.py` and
 under pytest. Checks 4 and 5 write to the source and clean up after
@@ -107,6 +109,32 @@ def test_plan_checkoffs_extracted():
                  "txn_plan_checkoffs" in TABLES_BY_NAME and ok)
 
 
+def test_party_meeting_point():
+    """08: both coordinates or neither, inside WGS84; the pin reaches the lake."""
+    rows = pd.DataFrame([
+        # lat, lng, expected
+        (13.731457, 100.541412, True),   # สวนลุมพินี
+        (None, None, True),              # a party without a pin
+        (13.7, None, False),             # half a pin
+        (95.0, 100.5, False),            # off the globe
+        (13.7, 200.0, False),
+    ], columns=["meeting_lat", "meeting_lng", "expected"])
+    df = rows.drop(columns="expected").assign(event_owner=1, status="scheduled", visibility="public")
+    good, _ = apply_dq(df, "txn_events")
+    wrong = rows[df.index.isin(good.index) != rows["expected"]]
+    gate = check("quality gate accepts a whole map pin, rejects half or out-of-range pins",
+                 wrong.empty, "all 5 cases as expected" if wrong.empty else wrong.to_dict("records"))
+
+    in_source = _scalar("""SELECT count(*) FROM information_schema.columns
+                           WHERE table_name = 'txn_events' AND column_name = 'meeting_lat'""") == 1
+    silver, dim = _df(SILVER / "txn_events"), _df(GOLD / "dim_event")
+    landed = not in_source or ("meeting_lat" in silver.columns and "meeting_lat" in dim.columns)
+    lake = check("txn_events.meeting_lat / meeting_lng reach silver and dim_event", landed,
+                 "source has no 08 columns yet" if not in_source else
+                 f"silver={'meeting_lat' in silver.columns} dim_event={'meeting_lat' in dim.columns}")
+    assert gate and lake
+
+
 # --------------------------------------------------------------------------
 def _cleanup():
     _exec(f"DELETE FROM txn_workout_summaries WHERE external_activity_id LIKE '{MARK}-%'")
@@ -158,7 +186,7 @@ def run_all(verbose: bool = True, *, fresh: bool = False) -> pd.DataFrame:
         assert run_pipeline("init", echo=False).ok
     for t in (test_dq_matches_the_app, test_onboarding_form_never_enters_the_lake,
               test_json_columns_are_json, test_plan_checkoffs_extracted,
-              test_hard_deletes_and_new_columns):
+              test_party_meeting_point, test_hard_deletes_and_new_columns):
         try:
             t()
         except AssertionError:
