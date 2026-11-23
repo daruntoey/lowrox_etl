@@ -79,7 +79,12 @@ WITH checks(item, ok, fix) AS (
   ('09 LINE: claim_line_notifications exists and is not callable by members',
      CASE WHEN to_regprocedure('public.claim_line_notifications(int)') IS NULL THEN false
           ELSE NOT has_function_privilege('authenticated', 'public.claim_line_notifications(int)', 'EXECUTE') END,
-     'sql/09_line_notifications.sql')
+     'sql/09_line_notifications.sql'),
+  ('10 reminders: queue_event_reminders / kick_line_push, one reminder per member per event',
+     to_regprocedure('public.queue_event_reminders(date)') IS NOT NULL
+     AND to_regprocedure('public.kick_line_push()') IS NOT NULL
+     AND to_regclass('public.txn_notifications_reminder_1d_once') IS NOT NULL,
+     'sql/10_event_reminders.sql (and check cron.job for lowrox-event-reminders-1d)')
 )
 SELECT item, ok, CASE WHEN ok THEN '' ELSE 'run ' || fix END AS action
 FROM checks;

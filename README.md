@@ -194,6 +194,7 @@ any re-run of 04.
 | 6 | `sql/07_storage_select_policy.sql` | lets members see, and so remove, their own uploads in `avatars` / `comment-images` |
 | 7 | `sql/08_party_meeting_point.sql` | `txn_events.meeting_lat` / `meeting_lng` and `create_party(..., p_meeting_lat, p_meeting_lng)` for the party map pin; run it before merging the web change |
 | 8 | `sql/09_line_notifications.sql` | LINE pushes from `txn_notifications` (`channel = 'line'`): retry key and error columns, members lose write access to the table, `claim_line_notifications()` for the `line-push` Edge Function, and a pg_net trigger (Supabase only; set the two Vault secrets at the end of the file) |
+| 9 | `sql/10_event_reminders.sql` | daily 18:00 (Bangkok) LINE reminder to members of events that start tomorrow (`queue_event_reminders()`, one per member per event) and a 10-minute retry that calls `line-push` while LINE rows are queued (Supabase Cron / pg_cron; skipped on plain PostgreSQL) |
 | check | `sql/verify_web_contract.sql` | read-only; every row should say `ok = true` |
 
 On a plain PostgreSQL (local source, CI) run `sql/00_supabase_local_stub.sql`
