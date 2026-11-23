@@ -84,7 +84,11 @@ WITH checks(item, ok, fix) AS (
      to_regprocedure('public.queue_event_reminders(date)') IS NOT NULL
      AND to_regprocedure('public.kick_line_push()') IS NOT NULL
      AND to_regclass('public.txn_notifications_reminder_1d_once') IS NOT NULL,
-     'sql/10_event_reminders.sql (and check cron.job for lowrox-event-reminders-1d)')
+     'sql/10_event_reminders.sql (and check cron.job for lowrox-event-reminders-1d)'),
+  ('11 host message: join trigger and one message per joiner',
+     EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'txn_event_participants_notify_host' AND NOT tgisinternal)
+     AND to_regclass('public.txn_notifications_party_joined_once') IS NOT NULL,
+     'sql/11_party_join_notify.sql')
 )
 SELECT item, ok, CASE WHEN ok THEN '' ELSE 'run ' || fix END AS action
 FROM checks;

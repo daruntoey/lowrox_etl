@@ -198,14 +198,16 @@ def _seed(db: str, scale: int, project_dir: Path, verbose: bool) -> int:
     # After the seed, the same steps Supabase has had: auth + RLS (03), the web
     # app's columns, RPCs and tables (04), LINE Login (06) and the storage
     # SELECT policy that lets members remove their own uploads (07) and the
-    # party map pin (08), LINE notifications (09) and event reminders (10). The stub stands
+    # party map pin (08), LINE notifications (09), event reminders (10) and
+    # join messages to hosts (11). The stub stands
     # in for the auth/storage schemas a plain PostgreSQL does not have.
     supabase_steps = [sql / f for f in ("00_supabase_local_stub.sql", "03_auth_and_rls.sql",
                                         "04_frontend_integration.sql", "06_line_login.sql",
                                         "07_storage_select_policy.sql",
                                         "08_party_meeting_point.sql",
                                         "09_line_notifications.sql",
-                                        "10_event_reminders.sql")]
+                                        "10_event_reminders.sql",
+                                        "11_party_join_notify.sql")]
     for f in (schema, seed, *supabase_steps):
         # The files are read by the postgres system user, which cannot see a
         # project folder that is only readable by its owner.

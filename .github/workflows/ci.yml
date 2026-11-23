@@ -37,7 +37,7 @@ jobs:
         env: { PGPASSWORD: lowrox }
         run: |
           # the same public schema as Supabase: 01 + 02, then 03/04/06/07 on a stub of auth/storage
-          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login 07_storage_select_policy 08_party_meeting_point 09_line_notifications 10_event_reminders; do
+          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login 07_storage_select_policy 08_party_meeting_point 09_line_notifications 10_event_reminders 11_party_join_notify; do
             psql -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f sql/$f.sql
           done
       - name: ETL test suites
@@ -80,7 +80,7 @@ jobs:
         env: { PGPASSWORD: lowrox }
         run: |
           # the same public schema as Supabase: 01 + 02, then 03/04/06/07 on a stub of auth/storage
-          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login 07_storage_select_policy 08_party_meeting_point 09_line_notifications 10_event_reminders; do
+          for f in 01_schema 02_seed 00_supabase_local_stub 03_auth_and_rls 04_frontend_integration 06_line_login 07_storage_select_policy 08_party_meeting_point 09_line_notifications 10_event_reminders 11_party_join_notify; do
             psql -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f sql/$f.sql
           done
       - name: Validate data, schema and model
