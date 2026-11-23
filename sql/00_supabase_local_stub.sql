@@ -8,12 +8,13 @@
 -- exactly the same public schema as Supabase.
 --
 -- Order on a plain PostgreSQL:
---   01_schema → 02_seed → 00_supabase_local_stub → 03 → 04 → 06 → 07
+--   01_schema → 02_seed → 00_supabase_local_stub → 03 → 04 → 06 → 07 → 08 → 09
 -- ใช้เฉพาะเครื่อง local / CI เท่านั้น ห้ามรันบน Supabase
 -- ============================================================
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon NOLOGIN; END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN CREATE ROLE service_role NOLOGIN BYPASSRLS; END IF;
 END $$;
 
 CREATE SCHEMA IF NOT EXISTS auth;
