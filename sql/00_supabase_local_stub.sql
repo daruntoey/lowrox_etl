@@ -8,7 +8,7 @@
 -- exactly the same public schema as Supabase.
 --
 -- Order on a plain PostgreSQL:
---   01_schema → 02_seed → 00_supabase_local_stub → 03 → 04 → 06 → 07 → 08 → 09
+--   01_schema → 02_seed → 00_supabase_local_stub → 03 → 04 → 06 → 07 → 08 → 09 → 10
 -- ใช้เฉพาะเครื่อง local / CI เท่านั้น ห้ามรันบน Supabase
 -- ============================================================
 DO $$ BEGIN
