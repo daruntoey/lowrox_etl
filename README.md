@@ -193,6 +193,7 @@ any re-run of 04.
 | 5 | `sql/06_line_login.sql` | `ms_users.line_user_id`, LINE-aware sign-up trigger |
 | 6 | `sql/07_storage_select_policy.sql` | lets members see, and so remove, their own uploads in `avatars` / `comment-images` |
 | 7 | `sql/08_party_meeting_point.sql` | `txn_events.meeting_lat` / `meeting_lng` and `create_party(..., p_meeting_lat, p_meeting_lng)` for the party map pin; run it before merging the web change |
+| 8 | `sql/09_line_notifications.sql` | LINE pushes from `txn_notifications` (`channel = 'line'`): retry key and error columns, members lose write access to the table, `claim_line_notifications()` for the `line-push` Edge Function, and a pg_net trigger (Supabase only; set the two Vault secrets at the end of the file) |
 | check | `sql/verify_web_contract.sql` | read-only; every row should say `ok = true` |
 
 On a plain PostgreSQL (local source, CI) run `sql/00_supabase_local_stub.sql`
@@ -211,8 +212,9 @@ between 02 and 03: it stands in for Supabase's `auth` and `storage` schemas.
 | adds columns over time (06's `line_user_id`) | Silver merges with schema evolution, so new columns arrive | `transform` merge |
 | events gain `title`, `target_level`, `is_party`, `visibility`; status `draft` | carried into `dim_event`; DQ knows the statuses | `load`, `transform` |
 | hosts drop a map pin on the meeting point (08) | both coordinates or neither, inside WGS84, else quarantined; the pin is carried into `dim_event` | `transform.DQ_RULES`, `load` |
+| LINE notifications (09): rows with `channel = 'line'`, status `sending`, new columns | flow into Silver as they are; `mlops` engagement features leave LINE rows out (no read receipts) | `mlops/features.py` |
 
-`tests/test_app_contract.py` pins all of the above (9 checks).
+`tests/test_app_contract.py` pins all of the above (12 checks).
 
 > **Real members exist now.** Members 51 and 52 signed up through the web app.
 > `test_incremental.py` and `test_app_contract.py` write to the source and are

@@ -16,6 +16,8 @@ this pipeline extracts, through sql/04_frontend_integration.sql and
   6. the weekly plan table is extracted
   7. a party's map pin (08_party_meeting_point.sql) passes the gate only as a
      whole, in range pin, and reaches Silver and Gold dim_event
+  8. LINE notifications (09_line_notifications.sql) reach Silver, and the
+     engagement features leave them out (LINE has no read receipts)
 
 Like the other suites it works as `python tests/test_app_contract.py` and
 under pytest. Checks 4 and 5 write to the source and clean up after
@@ -135,6 +137,40 @@ def test_party_meeting_point():
     assert gate and lake
 
 
+def test_line_notifications():
+    """09: LINE rows flow through the lake; open-rate features ignore them."""
+    from mlops.features import _compute_engagement
+
+    in_source = _scalar("""SELECT count(*) FROM information_schema.columns
+                           WHERE table_name = 'txn_notifications' AND column_name = 'retry_key'""") == 1
+    silver = _df(SILVER / "txn_notifications")
+    landed = check("txn_notifications retry_key / error_message reach silver",
+                   not in_source or {"retry_key", "error_message"} <= set(silver.columns),
+                   "source has no 09 columns yet" if not in_source else f"{len(silver)} rows")
+
+    rows = pd.DataFrame({"user_id": [1, 1, 2], "channel": ["in_app", "line", "line"],
+                         "status": ["sent"] * 3, "send_status": ["sent", "sending", "sent"]})
+    good, _ = apply_dq(rows.drop(columns="status"), "txn_notifications")
+    gate = check("quality gate keeps LINE rows, including 'sending'", len(good) == 3, f"{len(good)}/3 kept")
+
+    t = pd.Timestamp("2026-11-20", tz="UTC")
+    src = {
+        "txn_notifications": pd.DataFrame({
+            "user_id": [1, 1, 1], "channel": ["in_app", "line", "line"],
+            "sent_at": [t - pd.Timedelta(days=d) for d in (1, 2, 3)],
+            "opened_at": [t - pd.Timedelta(days=1), None, None]}),
+        "txn_event_participants": pd.DataFrame({"user_id": [], "created_at": []}),
+        "txn_group_comments": pd.DataFrame({"user_id": [], "created_at": []}),
+        "snapshots": pd.DatetimeIndex([t]),
+        "ms_users": pd.DataFrame({"id": [1]}),
+    }
+    eng = _compute_engagement(src).set_index("user_id").loc[1]
+    features = check("engagement counts only channels with opens (open_rate stays 1.0)",
+                     eng["notifications_30d"] == 1 and eng["open_rate_30d"] == 1.0,
+                     f"notifications_30d={eng['notifications_30d']} open_rate_30d={eng['open_rate_30d']}")
+    assert landed and gate and features
+
+
 # --------------------------------------------------------------------------
 def _cleanup():
     _exec(f"DELETE FROM txn_workout_summaries WHERE external_activity_id LIKE '{MARK}-%'")
@@ -186,7 +222,8 @@ def run_all(verbose: bool = True, *, fresh: bool = False) -> pd.DataFrame:
         assert run_pipeline("init", echo=False).ok
     for t in (test_dq_matches_the_app, test_onboarding_form_never_enters_the_lake,
               test_json_columns_are_json, test_plan_checkoffs_extracted,
-              test_party_meeting_point, test_hard_deletes_and_new_columns):
+              test_party_meeting_point, test_line_notifications,
+              test_hard_deletes_and_new_columns):
         try:
             t()
         except AssertionError:

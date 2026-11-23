@@ -236,6 +236,10 @@ ACTIVITY = REGISTRY.register(FeatureSet(
 # --------------------------------------------------------------------------
 def _compute_engagement(src: dict) -> pd.DataFrame:
     notif = src["txn_notifications"].copy()
+    # LINE pushes (sql 09) have no read receipts: counting them would make open_rate_30d
+    # fall although members behave the same. Engagement uses the channels that report opens.
+    if "channel" in notif.columns:
+        notif = notif[notif["channel"].fillna("") != "line"]
     parts = src["txn_event_participants"].copy()
     comments = src["txn_group_comments"].copy()
     snaps = src["snapshots"]

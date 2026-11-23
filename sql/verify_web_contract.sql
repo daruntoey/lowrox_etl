@@ -64,7 +64,22 @@ WITH checks(item, ok, fix) AS (
      (SELECT count(*) = 1 AND bool_and(pg_get_function_identity_arguments(p.oid) LIKE '%p_meeting_lat%')
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = 'public' AND p.proname = 'create_party'),
-     'sql/08_party_meeting_point.sql (again, if 04 was re-run)')
+     'sql/08_party_meeting_point.sql (again, if 04 was re-run)'),
+  ('09 LINE: txn_notifications accepts channel line and has retry_key / error_message',
+     (SELECT count(*) = 2 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'txn_notifications'
+        AND column_name IN ('retry_key', 'error_message'))
+     AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'txn_notifications_channel_check'
+                 AND pg_get_constraintdef(oid) LIKE '%line%'),
+     'sql/09_line_notifications.sql'),
+  ('09 LINE: members cannot write notifications (only line-push does)',
+     NOT has_table_privilege('authenticated', 'public.txn_notifications', 'INSERT')
+     AND NOT has_table_privilege('authenticated', 'public.txn_notifications', 'UPDATE'),
+     'sql/09_line_notifications.sql'),
+  ('09 LINE: claim_line_notifications exists and is not callable by members',
+     CASE WHEN to_regprocedure('public.claim_line_notifications(int)') IS NULL THEN false
+          ELSE NOT has_function_privilege('authenticated', 'public.claim_line_notifications(int)', 'EXECUTE') END,
+     'sql/09_line_notifications.sql')
 )
 SELECT item, ok, CASE WHEN ok THEN '' ELSE 'run ' || fix END AS action
 FROM checks;
@@ -77,4 +92,6 @@ UNION ALL SELECT 'runs logged in the app', count(*) FROM txn_workout_summaries W
 UNION ALL SELECT 'parties hosted in the app', count(*) FROM txn_events WHERE title IS NOT NULL
 UNION ALL SELECT 'weekly plan ticks', count(*) FROM txn_plan_checkoffs
 UNION ALL SELECT 'parties with a map pin', count(*) FROM txn_events
-  WHERE to_jsonb(txn_events) ->> 'meeting_lat' IS NOT NULL;
+  WHERE to_jsonb(txn_events) ->> 'meeting_lat' IS NOT NULL
+UNION ALL SELECT 'LINE notifications ' || coalesce(send_status, '?'), count(*) FROM txn_notifications
+  WHERE channel = 'line' GROUP BY send_status;
