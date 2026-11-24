@@ -196,6 +196,8 @@ any re-run of 04.
 | 8 | `sql/09_line_notifications.sql` | LINE pushes from `txn_notifications` (`channel = 'line'`): retry key and error columns, members lose write access to the table, `claim_line_notifications()` for the `line-push` Edge Function, and a pg_net trigger (Supabase only; set the two Vault secrets at the end of the file) |
 | 9 | `sql/10_event_reminders.sql` | daily 18:00 (Bangkok) LINE reminder to members of events that start tomorrow (`queue_event_reminders()`, one per member per event) and a 10-minute retry that calls `line-push` while LINE rows are queued (Supabase Cron / pg_cron; skipped on plain PostgreSQL) |
 | 10 | `sql/11_party_join_notify.sql` | LINE message to the host when a member joins their party (trigger on `txn_event_participants`, `txn_notifications.actor_user_id`, one message per joiner per event; never blocks a join) |
+| 11 | `sql/12_dw_mock_data.sql` | schema `dw`: the warehouse (9 dimensions, 5 facts) from the mock seed; replaced by the daily workflow later |
+| 12 | `sql/13_etl_roles.sql` | `lowrox_etl_reader` (read-only extract) and `lowrox_dw_writer` (owns `dw`); set their passwords yourself |
 | check | `sql/verify_web_contract.sql` | read-only; every row should say `ok = true` |
 
 On a plain PostgreSQL (local source, CI) run `sql/00_supabase_local_stub.sql`
@@ -224,6 +226,48 @@ between 02 and 03: it stands in for Supabase's `auth` and `storage` schemas.
 > and stop setting `LOWROX_ALLOW_SOURCE_WRITES=1` for the Supabase notebook.
 
 ---
+
+## The data warehouse (Gold) and the full loop
+
+Gold follows the warehouse design: 9 dimensions and 5 facts.
+
+| Table | Grain / kind | Additive facts | Keys |
+|---|---|---|---|
+| `fct_workout_session` | one validated workout, transaction | `duration_sec`, `distance_km`, `calories_kcal`, `heart_beat_count` | day, user, profile, type, area, device, workout_info, event; `external_activity_id` (DD) |
+| `fct_event_participation` | one user joining an event, transaction | `joined_count`, `attended_count`, `no_show_count`, `cancelled_count`, `lead_time_hours` | day, user, profile, area, type, event |
+| `fct_subscription_payment` | one payment attempt, transaction | `attempt_count`, `succeeded_amount_thb`, `failed_amount_thb`, `refunded_amount_thb` | day, user, profile, plan |
+| `fct_notification_delivery` | one notification, accumulating snapshot | `sent_count`, `delivered_count`, `opened_count`, `clicked_count` (+ milestone timestamps) | day, user, profile, event |
+| `fct_user_fitness_weekly` | one user per week, periodic snapshot (zero weeks kept) | `session_count`, `total_km`, `total_duration_sec`, `total_beat_count` | day (week start), user, profile, area |
+
+Dimensions: `dim_day`, `dim_user` (SCD2, email only as `email_token`), `dim_user_profile`
+(mini-dimension: age band × gender × fitness level, resolved as of each fact),
+`dim_area`, `dim_workout_type`, `dim_device` (0 = manual entry), `dim_workout_info`
+(junk: entry method, heart rate / calories present, event session), `dim_plan`, `dim_event`.
+`fct_payment_transaction` is still written for the notebooks and `mlops`.
+`tests/test_warehouse.py` checks that every table exists, every key resolves, each fact
+has its grain, and the additive facts reconcile with Silver.
+
+LINE notifications have no delivery or read receipts, so their delivered / opened
+milestones stay empty. The web has no check-in yet, so real `attended_count` is 0 until it does.
+
+**Full loop.** Supabase is the storage for every layer; GitHub Actions runs the code:
+
+```
+web / LINE ──▶ Supabase app tables ──(lowrox_etl_reader)──▶ GitHub Actions: python -m etl
+                                                              │  lake synced to / from a private
+                                                              │  Supabase Storage bucket (S3)
+                                                              ▼
+                     Supabase schema dw  ◀──(lowrox_dw_writer)── python -m etl.publish
+```
+
+1. `sql/12_dw_mock_data.sql` — the warehouse built from the mock seed, to look at now.
+2. `sql/13_etl_roles.sql` — a read-only role for extract and a role that only owns `dw`;
+   then set their passwords yourself.
+3. Storage: create a private bucket `lowrox-lake` and an S3 access key.
+4. GitHub secrets: `LOWROX_SOURCE_DSN`, `LOWROX_DW_DSN` (Session pooler URLs),
+   `SUPABASE_S3_ENDPOINT`, `SUPABASE_S3_REGION`, `SUPABASE_S3_KEY_ID`, `SUPABASE_S3_SECRET`.
+5. Run `.github/workflows/etl-daily.yml` once by hand with **init**; after that it runs
+   daily at 02:13 Bangkok, incrementally.
 
 ## Running without the notebook
 

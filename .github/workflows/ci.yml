@@ -49,6 +49,9 @@ jobs:
           python -c "from etl import run_pipeline, reset_lake; reset_lake(); \
                      r=run_pipeline('init', echo=False); \
                      assert r.ok, 'init load failed'"
+          python tests/test_warehouse.py
+          python -m etl.publish --sql "$RUNNER_TEMP/dw.sql"
+          PGPASSWORD=lowrox psql -q -v ON_ERROR_STOP=1 -h localhost -U lowrox -d lowrox -f "$RUNNER_TEMP/dw.sql"
           python tests/test_functional.py
           python tests/test_incremental.py
           python tests/test_app_contract.py
