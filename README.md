@@ -268,6 +268,10 @@ web / LINE ──▶ Supabase app tables ──(lowrox_etl_reader)──▶ GitH
    `SUPABASE_S3_ENDPOINT`, `SUPABASE_S3_REGION`, `SUPABASE_S3_KEY_ID`, `SUPABASE_S3_SECRET`.
 5. Run `.github/workflows/etl-daily.yml` once by hand with **init**; after that it runs
    daily at 02:13 Bangkok, incrementally.
+6. `.github/workflows/cd.yml` trains on that same lake (Silver, read-only) every Monday
+   and after a manual ETL run, and keeps the model registry, feature store and ML
+   metadata in `lowrox-lake/mlops_store`, so promotion compares with the model that is
+   really in production.
 
 ## Running without the notebook
 
