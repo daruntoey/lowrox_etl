@@ -1,14 +1,24 @@
 # Stages 3, 4 and 5 of slide 12 — pipeline CD, automated triggering,
 # continuous training, and model CD.
 #
+# Trains on the SAME persistent lake the daily ETL writes (Supabase Storage,
+# bucket lowrox-lake) and keeps the model registry, feature store and ML
+# metadata next to it (lowrox-lake/mlops_store), so "promote only if it beats
+# production" compares against the model that was really in production last
+# week instead of an empty registry.
+#
 # The schedule is the "Trigger" box in the level 1 and 2 diagrams. The
 # promotion step is what stops continuous training from becoming continuous
 # degradation: a retrained model is not automatically a better model.
+#
+# Secrets: the same Supabase Storage S3 secrets as etl-daily.yml.
 name: CD — continuous training and deployment
 
 on:
   workflow_run:
-    workflows: [CI]
+    # after a MANUAL ETL run (e.g. an init reload) — the daily scheduled ETL
+    # runs leave retraining to the weekly schedule below
+    workflows: ['ETL — daily load and publish']
     types: [completed]
     branches: [main]
   schedule:
@@ -21,16 +31,26 @@ on:
         default: false
 
 concurrency:
-  group: lowrox-cd
-  cancel-in-progress: false      # never interrupt a training run mid-flight
+  group: lowrox-lake            # never read the lake while the ETL is writing it
+  cancel-in-progress: false
 
 jobs:
   continuous-training:
     if: >-
       github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     environment: production
+    env:
+      LOWROX_LAKE_ROOT: ${{ github.workspace }}/lake
+      LOWROX_MLOPS_ROOT: ${{ github.workspace }}/mlops_store
+      AWS_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET }}
+      AWS_DEFAULT_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+      S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+      LAKE_URI: s3://lowrox-lake/lake
+      MLOPS_URI: s3://lowrox-lake/mlops_store
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,31 +59,39 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt -r requirements-ml.txt
 
+      - name: Download the lake (read-only) and the MLOps store
+        run: |
+          mkdir -p "$LOWROX_LAKE_ROOT" "$LOWROX_MLOPS_ROOT"
+          aws s3 sync "$LAKE_URI/silver" "$LOWROX_LAKE_ROOT/silver" --endpoint-url "$S3_ENDPOINT" --only-show-errors
+          aws s3 sync "$MLOPS_URI" "$LOWROX_MLOPS_ROOT" --endpoint-url "$S3_ENDPOINT" --only-show-errors
+          if [ ! -d "$LOWROX_LAKE_ROOT/silver/ms_users/_delta_log" ]; then
+            echo "::error::no Silver in lowrox-lake — run 'ETL — daily load and publish' (init) first"
+            exit 1
+          fi
+          echo "models already in the registry:"; ls "$LOWROX_MLOPS_ROOT/model_registry/lowrox_churn" 2>/dev/null || echo "  (none yet)"
+
       - name: Stage 3 — deploy the pipeline
         run: python -m mlops.pipeline_cd --stage deploy-pipeline
 
       - name: Stage 4 — evaluate triggers and train
-        env:
-          LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
-          LOWROX_LAKE_ROOT: ${{ runner.temp }}/lake
         run: python -m mlops.pipeline_cd --stage train
 
       - name: Stage 5 — promote only if it beats production
-        env:
-          LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
         run: |
           python -m mlops.pipeline_cd --stage promote \
             ${{ inputs.force_promote && '--force' || '' }}
 
       - name: Stage 6 — monitor and publish the dashboard
-        env:
-          LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
         run: python -m mlops.pipeline_cd --stage monitor
+
+      - name: Save the registry, feature store and metadata back to Supabase Storage
+        if: success()
+        run: aws s3 sync "$LOWROX_MLOPS_ROOT" "$MLOPS_URI" --endpoint-url "$S3_ENDPOINT" --only-show-errors
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: model-and-dashboard
           path: |
-            model_registry/
-            lowrox_dashboard.html
+            mlops_store/model_registry/
+            mlops_store/lowrox_dashboard.html

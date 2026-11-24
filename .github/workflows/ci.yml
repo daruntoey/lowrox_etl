@@ -90,7 +90,12 @@ jobs:
         env:
           LOWROX_SOURCE_DSN: postgresql://lowrox:lowrox@localhost:5432/lowrox
           LOWROX_LAKE_ROOT: ${{ runner.temp }}/lake
-        run: python -m mlops.pipeline_ci
+        run: |
+          # build Silver from the seed, then top it up with synthetic history:
+          # 50 seed rows per table are too few to train and validate a model
+          python -m etl --init
+          python -c "import os; from mlops import demo_data; demo_data.ensure_training_data(os.environ['LOWROX_LAKE_ROOT'])"
+          python -m mlops.pipeline_ci
       - uses: actions/upload-artifact@v4
         if: always()
         with:
