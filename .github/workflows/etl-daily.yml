@@ -1,0 +1,79 @@
+# The full loop, every day:
+#   Supabase (app tables) → Bronze → Silver → Gold → Supabase schema dw
+# The lake lives in a private Supabase Storage bucket, so incremental loads,
+# watermarks and dim_user's SCD2 history carry over from one run to the next.
+#
+# Secrets (Settings → Secrets and variables → Actions), see README "Full loop":
+#   LOWROX_SOURCE_DSN     lowrox_etl_reader via the Session pooler (sql/13)
+#   LOWROX_DW_DSN         lowrox_dw_writer via the Session pooler (sql/13)
+#   SUPABASE_S3_ENDPOINT  Storage → Settings → S3 connection → Endpoint
+#   SUPABASE_S3_REGION    Storage → Settings → S3 connection → Region
+#   SUPABASE_S3_KEY_ID / SUPABASE_S3_SECRET   Storage → Settings → S3 access keys
+name: ETL — daily load and publish
+
+on:
+  schedule:
+    - cron: '13 19 * * *'      # 02:13 Bangkok, off the hour
+  workflow_dispatch:
+    inputs:
+      init:
+        description: Rebuild the lake from nothing (full reload)
+        type: boolean
+        default: false
+
+concurrency:
+  group: lowrox-lake            # one writer of the lake at a time
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      LOWROX_SOURCE_DSN: ${{ secrets.LOWROX_SOURCE_DSN }}
+      LOWROX_DW_DSN: ${{ secrets.LOWROX_DW_DSN }}
+      LOWROX_LAKE_ROOT: ${{ github.workspace }}/lake
+      AWS_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET }}
+      AWS_DEFAULT_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+      S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+      LAKE_URI: s3://lowrox-lake/lake
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Check the secrets are set
+        run: |
+          for v in LOWROX_SOURCE_DSN LOWROX_DW_DSN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION S3_ENDPOINT; do
+            [ -n "${!v}" ] || { echo "::error::secret for $v is not set"; exit 1; }
+          done
+
+      - name: Download the lake from Supabase Storage
+        run: |
+          mkdir -p "$LOWROX_LAKE_ROOT"
+          aws s3 sync "$LAKE_URI" "$LOWROX_LAKE_ROOT" --endpoint-url "$S3_ENDPOINT" --only-show-errors
+          du -sh "$LOWROX_LAKE_ROOT" || true
+
+      - name: Extract → Bronze → Silver → Gold
+        run: python -m etl ${{ inputs.init && '--init' || '' }}
+
+      - name: Warehouse checks (grain, keys, reconciliation)
+        run: python tests/test_warehouse.py
+
+      - name: Publish Gold to Supabase schema dw
+        run: python -m etl.publish
+
+      - name: Upload the lake back to Supabase Storage
+        if: success()
+        run: aws s3 sync "$LOWROX_LAKE_ROOT" "$LAKE_URI" --endpoint-url "$S3_ENDPOINT" --delete --only-show-errors
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: run-control
+          path: lake/_control/
+          retention-days: 14

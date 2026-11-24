@@ -172,6 +172,15 @@ def lookup_scd2(fact: pd.DataFrame, nk_col: str, dim: pd.DataFrame, dim_nk: str,
     return keys
 
 
+def _nk_text(v):
+    """A natural key as comparable text: 12, 12.0 and '12' are the same key."""
+    if v is None or (isinstance(v, float) and pd.isna(v)) or v is pd.NA:
+        return None
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def lookup(fact: pd.DataFrame, nk_col: str, dim: pd.DataFrame,
            dim_nk: str, dim_key: str, *, absent_key: int = KEY_NOT_APPLICABLE) -> pd.Series:
     """
@@ -182,9 +191,13 @@ def lookup(fact: pd.DataFrame, nk_col: str, dim: pd.DataFrame,
     """
     if dim.empty:
         return pd.Series(KEY_UNKNOWN, index=fact.index, dtype="int64")
-    m = dim.set_index(dim_nk)[dim_key]
+    # Type 1 dimensions store their natural key as text (load_dim_type1), while
+    # a fact carries the source type (event_id 12, plan_id 3.0). Compare both as
+    # the same text, or every numeric key would resolve to -1 Unknown.
+    m = dim.set_index(dim[dim_nk].map(_nk_text))[dim_key]
+    m = m[~m.index.duplicated(keep="first")]
     vals = fact[nk_col]
-    keys = vals.map(m)
+    keys = vals.map(_nk_text).map(m)
     keys = keys.where(vals.notna(), absent_key)          # null NK -> not applicable
     keys = keys.where(~(vals.notna() & keys.isna()), KEY_UNKNOWN)   # no match -> unknown
     return keys.astype("int64")
@@ -326,7 +339,7 @@ def load_dim_user(log: ErrorLog) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 def load_fct_workout_session(dims: dict, cfg: RunConfig, run_id: str, log: ErrorLog,
                              metrics: MetricsCollector, lineage: LineageRegistry,
-                             dlq: DeadLetterQueue) -> int:
+                             dlq: DeadLetterQueue, extras: pd.DataFrame | None = None) -> int:
     src = read_silver("txn_workout_summaries")
     with metrics.step("gold", "fct_workout_session") as m:
         m.load_type = cfg.load_type
@@ -373,6 +386,16 @@ def load_fct_workout_session(dims: dict, cfg: RunConfig, run_id: str, log: Error
                 out = out[~removed]
         else:
             out = f
+        if extras is not None and len(extras):
+            # design keys (load_dw): profile, area, workout_info, external id,
+            # heart beats — restated for every row, so older rows get them too
+            out = (out.drop(columns=[c for c in extras.columns if c != "workout_id"], errors="ignore")
+                      .merge(extras, on="workout_id", how="left"))
+            for c in ("user_profile_key", "workout_info_key"):
+                out[c] = out[c].fillna(KEY_UNKNOWN).astype("int64")
+            out["area_key"] = out["area_key"].fillna(KEY_NOT_APPLICABLE).astype("int64")
+            out["heart_beat_count"] = out["heart_beat_count"].fillna(0).astype("int64")
+            out["external_activity_id"] = out["external_activity_id"].fillna("").astype(str)
         version = write_gold("fct_workout_session", out, log)
 
         m.rows_out = len(f)
@@ -440,17 +463,39 @@ def load_gold(cfg: RunConfig, run_id: str, log: ErrorLog, metrics: MetricsCollec
               lineage: LineageRegistry, dlq: DeadLetterQueue) -> dict:
     log.stage = "load:gold"
 
+    from . import load_dw as dw
+
     workouts = read_silver("txn_workout_summaries")
     payments = read_silver("txn_payments")
     events = read_silver("txn_events")
     areas = read_silver("ms_area")
     devices = read_silver("ms_device_connections")
     plans = read_silver("ms_subscription_plans")
+    participants = read_silver("txn_event_participants")
+    notifications = read_silver("txn_notifications")
+    weekly = dw.weekly_frame(workouts)
 
+    empty = pd.Series(dtype="object")
+    part_at = (participants["joined_at"].fillna(participants["created_at"])
+               if len(participants) else empty)
+    note_at = (notifications["sent_at"].fillna(notifications["created_at"])
+               if len(notifications) else empty)
     dates = pd.concat([
-        workouts["started_at"] if len(workouts) else pd.Series(dtype="object"),
-        payments["created_at"] if len(payments) else pd.Series(dtype="object"),
+        workouts["started_at"] if len(workouts) else empty,
+        payments["created_at"] if len(payments) else empty,
+        part_at, note_at,
+        weekly["week_start_ts"] if len(weekly) else empty,
     ], ignore_index=True)
+
+    # profile (mini-dimension) of each fact row, as of that row's moment
+    prof = {
+        "workout": dw.profile_codes(workouts["user_id"], workouts["started_at"]) if len(workouts) else empty,
+        "participation": dw.profile_codes(participants["user_id"], part_at) if len(participants) else empty,
+        "payment": dw.profile_codes(payments["user_id"], payments["created_at"]) if len(payments) else empty,
+        "notification": dw.profile_codes(notifications["user_id"], note_at) if len(notifications) else empty,
+        "weekly": dw.profile_codes(weekly["user_id"], weekly["week_start_ts"]) if len(weekly) else empty,
+    }
+    info = dw.workout_info_codes(workouts) if len(workouts) else pd.DataFrame()
 
     dims = {}
     with metrics.step("gold", "dimensions") as m:
@@ -458,11 +503,14 @@ def load_gold(cfg: RunConfig, run_id: str, log: ErrorLog, metrics: MetricsCollec
         dims["dim_user"] = load_dim_user(log)
         dims["dim_workout_type"] = load_dim_type1(
             "dim_workout_type", "workout_type_key", "activity_type",
-            workouts[["activity_type"]].assign(
+            (lambda t: pd.DataFrame({"activity_type": t, "is_cardio": t.isin(
                 # the source codes (Silver is lower-cased), not short forms
-                is_cardio=workouts["activity_type"].isin(
-                    ["running", "cycling", "swimming", "walking", "hyrox_prep"])
-            ) if len(workouts) else pd.DataFrame(),
+                ["running", "cycling", "swimming", "walking", "hyrox_prep"])}))(
+                pd.concat([workouts["activity_type"] if len(workouts) else empty,
+                           # event types too, so fct_event_participation resolves them
+                           events["workout_type"].str.lower() if len(events) else empty],
+                          ignore_index=True).dropna().drop_duplicates()
+            ) if len(workouts) or len(events) else pd.DataFrame(),
             ["is_cardio"], log)
         dims["dim_device"] = load_dim_type1(
             "dim_device", "device_key", "provider",
@@ -491,10 +539,25 @@ def load_gold(cfg: RunConfig, run_id: str, log: ErrorLog, metrics: MetricsCollec
             plans.rename(columns={"id": "plan_id"})[["plan_id", "plan_code", "tier"]]
             if len(plans) else pd.DataFrame(),
             ["plan_code", "tier"], log)
+        dims["dim_user_profile"] = dw.load_dim_user_profile(
+            pd.concat(list(prof.values()), ignore_index=True), log)
+        dims["dim_workout_info"] = dw.load_dim_workout_info(info, log)
         m.rows_out = sum(len(d) for d in dims.values())
         log.info(f"dimensions: {m.rows_out} rows across {len(dims)} tables")
 
-    n_workout = load_fct_workout_session(dims, cfg, run_id, log, metrics, lineage, dlq)
+    extras = (dw.build_workout_extras(dims, workouts, events, areas, prof["workout"], info)
+              if len(workouts) else None)
+    n_workout = load_fct_workout_session(dims, cfg, run_id, log, metrics, lineage, dlq, extras)
+    # kept for the notebooks and mlops that read it; fct_subscription_payment is the design's name
     n_payment = load_fct_payment(dims, cfg, run_id, log, metrics, lineage, dlq)
+    with metrics.step("gold", "warehouse facts") as m:
+        n_sub = dw.load_fct_subscription_payment(dims, run_id, log, prof["payment"])
+        n_part = dw.load_fct_event_participation(dims, run_id, log, prof["participation"])
+        n_note = dw.load_fct_notification_delivery(dims, run_id, log, prof["notification"])
+        n_week = dw.load_fct_user_fitness_weekly(
+            dims, run_id, log, weekly, prof["weekly"], dw.weekly_area(weekly, workouts, events, areas))
+        m.rows_out = n_sub + n_part + n_note + n_week
     return {"dimensions": {k: len(v) for k, v in dims.items()},
-            "fct_workout_session": n_workout, "fct_payment_transaction": n_payment}
+            "fct_workout_session": n_workout, "fct_payment_transaction": n_payment,
+            "fct_subscription_payment": n_sub, "fct_event_participation": n_part,
+            "fct_notification_delivery": n_note, "fct_user_fitness_weekly": n_week}
