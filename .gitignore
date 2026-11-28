@@ -25,3 +25,5 @@ mlops_store/
 feature_store/
 out/
 predictions/
+
+dq_demo_lake/

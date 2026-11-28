@@ -51,6 +51,7 @@ build_notebook.py          regenerates the notebook
 | **`lowrox_full_demo.ipynb`** | the whole chain, source database to dashboard — Stage A is the ETL, Stage B is MLOps | nothing; it builds its own PostgreSQL source |
 | `lowrox_etl_demo.ipynb` | Stage A on its own, against Supabase | a connection string |
 | `lowrox_mlops_demo.ipynb` | Stage B on its own | nothing |
+| `lowrox_dq_demo.ipynb` | the 2-minute live demo of slide 9: incremental, idempotent, validated, recoverable, with a PASS/FAIL scorecard | nothing; it builds its own PostgreSQL source |
 
 `lowrox_full_demo.ipynb` is the one to run and the one to hand in. `SOURCE =
 "local"` in its setup cell installs PostgreSQL where the notebook is running
